@@ -1,0 +1,25 @@
+# Rust build artifacts
+/tai/target/
+target/
+
+# Cargo lock is useful for binaries, keep it
+# But ignore local cargo config
+.cargo/
+
+# macOS
+.DS_Store
+*.swp
+*.swo
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Environment / secrets
+.env
+.env.*
+
+# Temporary files
+*.tmp
+/tmp/

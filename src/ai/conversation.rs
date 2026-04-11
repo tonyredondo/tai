@@ -85,9 +85,13 @@ impl ConversationHistory {
     }
 
     pub fn build_messages(
-        &self,
+        &mut self,
         system: ChatCompletionRequestMessage,
     ) -> Vec<ChatCompletionRequestMessage> {
+        const MAX_CHARS: usize = 120_000;
+
+        self.trim_by_size(MAX_CHARS);
+
         let mut msgs = Vec::with_capacity(1 + self.messages.len());
         msgs.push(system);
         msgs.extend(self.messages.iter().cloned());
@@ -98,19 +102,81 @@ impl ConversationHistory {
         self.messages.clear();
     }
 
-    fn trim(&mut self) {
-        while self.messages.len() > self.max_exchanges * 2 {
-            let front = self.messages.front();
-            if let Some(ChatCompletionRequestMessage::Assistant(a)) = front {
-                if a.tool_calls.is_some() && self.messages.len() > 1 {
-                    self.messages.pop_front();
-                    if let Some(ChatCompletionRequestMessage::Tool(_)) = self.messages.front() {
-                        self.messages.pop_front();
-                    }
-                    continue;
+    pub fn remove_trailing_orphans(&mut self) {
+        loop {
+            match self.messages.back() {
+                Some(ChatCompletionRequestMessage::Assistant(a)) if a.tool_calls.is_some() && a.content.is_none() => {
+                    self.messages.pop_back();
+                }
+                Some(ChatCompletionRequestMessage::Tool(_)) => {
+                    self.messages.pop_back();
+                }
+                _ => break,
+            }
+        }
+    }
+
+    fn estimate_msg_chars(msg: &ChatCompletionRequestMessage) -> usize {
+        match msg {
+            ChatCompletionRequestMessage::System(m) => {
+                match &m.content {
+                    async_openai::types::ChatCompletionRequestSystemMessageContent::Text(t) => t.len(),
+                    _ => 100,
                 }
             }
-            self.messages.pop_front();
+            ChatCompletionRequestMessage::User(m) => {
+                match &m.content {
+                    async_openai::types::ChatCompletionRequestUserMessageContent::Text(t) => t.len(),
+                    _ => 100,
+                }
+            }
+            ChatCompletionRequestMessage::Assistant(m) => {
+                let content_len = m.content.as_ref().map(|c| match c {
+                    async_openai::types::ChatCompletionRequestAssistantMessageContent::Text(t) => t.len(),
+                    _ => 100,
+                }).unwrap_or(0);
+                let tools_len = m.tool_calls.as_ref().map(|tcs| {
+                    tcs.iter().map(|tc| tc.function.arguments.len() + tc.function.name.len() + 50).sum::<usize>()
+                }).unwrap_or(0);
+                content_len + tools_len
+            }
+            ChatCompletionRequestMessage::Tool(m) => {
+                match &m.content {
+                    async_openai::types::ChatCompletionRequestToolMessageContent::Text(t) => t.len(),
+                    _ => 100,
+                }
+            }
+            _ => 100,
         }
+    }
+
+    fn trim(&mut self) {
+        while self.messages.len() > self.max_exchanges * 2 {
+            self.pop_front_safe();
+        }
+    }
+
+    fn trim_by_size(&mut self, max_chars: usize) {
+        while self.messages.len() > 2 {
+            let total: usize = self.messages.iter().map(Self::estimate_msg_chars).sum();
+            if total <= max_chars {
+                break;
+            }
+            self.pop_front_safe();
+        }
+    }
+
+    fn pop_front_safe(&mut self) {
+        let front = self.messages.front();
+        if let Some(ChatCompletionRequestMessage::Assistant(a)) = front {
+            if a.tool_calls.is_some() && self.messages.len() > 1 {
+                self.messages.pop_front();
+                if let Some(ChatCompletionRequestMessage::Tool(_)) = self.messages.front() {
+                    self.messages.pop_front();
+                }
+                return;
+            }
+        }
+        self.messages.pop_front();
     }
 }

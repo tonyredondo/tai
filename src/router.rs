@@ -27,6 +27,13 @@ struct CommandCapture {
     raw_output: Vec<u8>,
 }
 
+struct QueuedToolCall {
+    id: String,
+    name: String,
+    command: String,
+    explanation: String,
+}
+
 pub struct InputRouter {
     mode: InputMode,
     ai_input_buffer: String,
@@ -39,6 +46,8 @@ pub struct InputRouter {
     config: TaiConfig,
     ai_text_buffer: String,
     command_capture: Option<CommandCapture>,
+    tool_call_queue: Vec<QueuedToolCall>,
+    has_pending_dispatch: bool,
     ai_first_token: bool,
     ai_after_command: bool,
 }
@@ -63,6 +72,8 @@ impl InputRouter {
             config: config.clone(),
             ai_text_buffer: String::new(),
             command_capture: None,
+            tool_call_queue: Vec::new(),
+            has_pending_dispatch: false,
             ai_first_token: false,
             ai_after_command: false,
         }
@@ -193,6 +204,23 @@ impl InputRouter {
             self.finish_command_capture(terminal, pty);
         }
 
+        if self.has_pending_dispatch && self.command_capture.is_none() {
+            self.has_pending_dispatch = false;
+            if !self.tool_call_queue.is_empty() {
+                self.dispatch_next_tool_call(terminal, pty, overlay);
+                return;
+            }
+            if let Some(ref bridge) = self.ai_bridge {
+                let cwd = pty.get_cwd().unwrap_or_else(|| PathBuf::from("~"));
+                let os = std::env::consts::OS;
+                let arch = std::env::consts::ARCH;
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string());
+                let system_msg = ContextBuilder::build_system_message(os, arch, &shell, &cwd);
+                let messages = self.conversation.build_messages(system_msg);
+                bridge.send(AiRequest::Chat { messages });
+            }
+        }
+
         let responses: Vec<_> = match self.ai_bridge {
             Some(ref b) => {
                 let mut v = Vec::new();
@@ -204,13 +232,13 @@ impl InputRouter {
             None => return,
         };
 
+        let mut batch_tool_calls: Vec<(String, String, String)> = Vec::new();
+
         for response in responses {
             match response {
                 AiResponse::Token(token) => {
                     if self.ai_first_token {
                         if self.ai_after_command {
-                            // Erase the shell prompt that appeared after command finished
-                            // (handles 2-line prompts like starship: info line + ❯ line)
                             terminal.vt_write(b"\r\x1b[2K\x1b[A\r\x1b[2K");
                             self.ai_after_command = false;
                         } else {
@@ -224,39 +252,13 @@ impl InputRouter {
                     let colored = format!("\x1b[36m{}\x1b[0m", display_token);
                     terminal.vt_write(colored.as_bytes());
                 }
-                AiResponse::ToolCall {
-                    id,
-                    name,
-                    arguments,
-                } => {
-                    if self.ai_after_command {
-                        terminal.vt_write(b"\r\x1b[2K\x1b[A\r\x1b[2K");
-                        self.ai_after_command = false;
-                    }
-
-                    if name == "run_command" {
-                        if let Ok(args) = serde_json::from_str::<serde_json::Value>(&arguments) {
-                            let command = args["command"].as_str().unwrap_or("").to_string();
-                            let explanation = args["explanation"]
-                                .as_str()
-                                .unwrap_or("")
-                                .to_string();
-
-                            if self.config.ai.auto_execute {
-                                self.execute_command(&command, &id, terminal, pty);
-                            } else {
-                                self.pending_command = Some(PendingCommand {
-                                    command: command.clone(),
-                                    explanation: explanation.clone(),
-                                    tool_call_id: id,
-                                });
-                                overlay.show(&command, &explanation);
-                                self.mode = InputMode::CommandConfirm;
-                            }
-                        }
-                    }
+                AiResponse::ToolCall { id, name, arguments } => {
+                    batch_tool_calls.push((id, name, arguments));
                 }
                 AiResponse::Done => {
+                    if !batch_tool_calls.is_empty() || self.command_capture.is_some() {
+                        continue;
+                    }
                     if self.ai_after_command {
                         terminal.vt_write(b"\r\x1b[2K\x1b[A\r\x1b[2K");
                         self.ai_after_command = false;
@@ -274,10 +276,48 @@ impl InputRouter {
                 AiResponse::Error(err) => {
                     let msg = format!("\r\n\x1b[31mTAI Error: {}\x1b[0m\r\n", err);
                     terminal.vt_write(msg.as_bytes());
+                    self.conversation.remove_trailing_orphans();
                     pty.write(b"\n");
                     self.mode = InputMode::Shell;
                 }
             }
+        }
+
+        if !batch_tool_calls.is_empty() {
+            if self.ai_after_command {
+                terminal.vt_write(b"\r\x1b[2K\x1b[A\r\x1b[2K");
+                self.ai_after_command = false;
+            }
+
+            let api_tool_calls: Vec<ChatCompletionMessageToolCall> = batch_tool_calls
+                .iter()
+                .map(|(id, name, args)| ChatCompletionMessageToolCall {
+                    id: id.clone(),
+                    r#type: async_openai::types::ChatCompletionToolType::Function,
+                    function: async_openai::types::FunctionCall {
+                        name: name.clone(),
+                        arguments: args.clone(),
+                    },
+                })
+                .collect();
+            self.conversation.push_assistant_tool_call(api_tool_calls);
+
+            for (id, name, arguments) in batch_tool_calls {
+                if name == "run_command" {
+                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&arguments) {
+                        let command = args["command"].as_str().unwrap_or("").to_string();
+                        let explanation = args["explanation"].as_str().unwrap_or("").to_string();
+                        self.tool_call_queue.push(QueuedToolCall {
+                            id,
+                            name,
+                            command,
+                            explanation,
+                        });
+                    }
+                }
+            }
+
+            self.dispatch_next_tool_call(terminal, pty, overlay);
         }
     }
 
@@ -300,16 +340,8 @@ impl InputRouter {
     ) {
         if let Some(pending) = self.pending_command.take() {
             overlay.hide();
-            let tool_call = ChatCompletionMessageToolCall {
-                id: pending.tool_call_id.clone(),
-                r#type: async_openai::types::ChatCompletionToolType::Function,
-                function: async_openai::types::FunctionCall {
-                    name: "run_command".to_string(),
-                    arguments: String::new(),
-                },
-            };
-            self.conversation.push_assistant_tool_call(vec![tool_call]);
             self.conversation.push_tool_result(&pending.tool_call_id, "User cancelled the command.");
+            self.tool_call_queue.clear();
             pty.write(b"\n");
             self.mode = InputMode::Shell;
         }
@@ -323,16 +355,8 @@ impl InputRouter {
         if let Some(pending) = self.pending_command.take() {
             overlay.hide();
             pty.write(pending.command.as_bytes());
-            let tool_call = ChatCompletionMessageToolCall {
-                id: pending.tool_call_id.clone(),
-                r#type: async_openai::types::ChatCompletionToolType::Function,
-                function: async_openai::types::FunctionCall {
-                    name: "run_command".to_string(),
-                    arguments: String::new(),
-                },
-            };
-            self.conversation.push_assistant_tool_call(vec![tool_call]);
             self.conversation.push_tool_result(&pending.tool_call_id, "User chose to edit the command manually.");
+            self.tool_call_queue.clear();
             self.mode = InputMode::Shell;
         }
     }
@@ -357,6 +381,34 @@ impl InputRouter {
 
     pub fn ai_available(&self) -> bool {
         self.ai_bridge.is_some()
+    }
+
+    fn dispatch_next_tool_call(
+        &mut self,
+        terminal: &mut Terminal,
+        pty: &Pty,
+        overlay: &mut CommandOverlay,
+    ) {
+        if self.tool_call_queue.is_empty() {
+            return;
+        }
+
+        let tc = self.tool_call_queue.remove(0);
+
+        if self.config.ai.auto_execute {
+            self.execute_command(&tc.command, &tc.id, terminal, pty);
+        } else {
+            self.pending_command = Some(PendingCommand {
+                command: tc.command,
+                explanation: tc.explanation,
+                tool_call_id: tc.id,
+            });
+            overlay.show(
+                &self.pending_command.as_ref().unwrap().command,
+                &self.pending_command.as_ref().unwrap().explanation,
+            );
+            self.mode = InputMode::CommandConfirm;
+        }
     }
 
     fn execute_command(
@@ -384,16 +436,6 @@ impl InputRouter {
         );
         let tmp_path = format!("/tmp/tai_cmd_{uuid}");
         let _ = std::fs::write(&tmp_path, &script);
-
-        let tool_call = ChatCompletionMessageToolCall {
-            id: tool_call_id.to_string(),
-            r#type: async_openai::types::ChatCompletionToolType::Function,
-            function: async_openai::types::FunctionCall {
-                name: "run_command".to_string(),
-                arguments: serde_json::json!({"command": command}).to_string(),
-            },
-        };
-        self.conversation.push_assistant_tool_call(vec![tool_call]);
 
         self.command_capture = Some(CommandCapture {
             start_marker,
@@ -443,8 +485,8 @@ impl InputRouter {
             }
         }
 
-        let truncated = if output.len() > 8000 {
-            let cut = &output[..8000];
+        let truncated = if output.len() > 4000 {
+            let cut = &output[..4000];
             format!("{}\n... [truncated, {} bytes total]", cut, output.len())
         } else {
             output.clone()
@@ -461,15 +503,7 @@ impl InputRouter {
         self.ai_after_command = true;
         self.mode = InputMode::AiStreaming;
 
-        if let Some(ref bridge) = self.ai_bridge {
-            let cwd = pty.get_cwd().unwrap_or_else(|| PathBuf::from("~"));
-            let os = std::env::consts::OS;
-            let arch = std::env::consts::ARCH;
-            let shell = std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string());
-            let system_msg = ContextBuilder::build_system_message(os, arch, &shell, &cwd);
-            let messages = self.conversation.build_messages(system_msg);
-            bridge.send(AiRequest::Chat { messages });
-        }
+        self.has_pending_dispatch = true;
     }
 
     fn strip_ansi(s: &str) -> String {

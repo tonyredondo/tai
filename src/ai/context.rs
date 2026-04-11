@@ -65,6 +65,13 @@ impl ContextBuilder {
             command_history.join(", ")
         };
 
+        let trimmed = if trimmed.len() > 6000 {
+            let cut = &trimmed[trimmed.len() - 6000..];
+            format!("...{}", cut)
+        } else {
+            trimmed
+        };
+
         let content = format!(
             "Terminal output (last {} lines):\n```\n{}\n```\n\nRecent commands: {}\n\nUser: {}",
             self.max_context_lines, trimmed, history_str, query

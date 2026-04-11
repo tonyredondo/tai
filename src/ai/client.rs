@@ -32,6 +32,12 @@ impl AiClient {
         messages: Vec<ChatCompletionRequestMessage>,
         response_tx: &mpsc::Sender<AiResponse>,
     ) -> Result<(), String> {
+        let msg_count = messages.len();
+        let total_chars: usize = messages.iter().map(|m| {
+            format!("{:?}", m).len()
+        }).sum();
+        eprintln!("[TAI] Sending {} messages (~{} chars) to {}", msg_count, total_chars, self.model);
+
         let request = CreateChatCompletionRequestArgs::default()
             .model(&self.model)
             .messages(messages)
@@ -40,12 +46,23 @@ impl AiClient {
             .build()
             .map_err(|e| format!("Failed to build request: {e}"))?;
 
-        let mut stream = self
+        let request_json = serde_json::to_string_pretty(&request).unwrap_or_default();
+
+        let mut stream = match self
             .client
             .chat()
             .create_stream(request)
             .await
-            .map_err(|e| format!("API error: {e}"))?;
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let detail = format!("{e:#}");
+                eprintln!("[TAI] API error: {detail}");
+                let _ = std::fs::write("/tmp/tai_last_request.json", &request_json);
+                eprintln!("[TAI] Request saved to /tmp/tai_last_request.json");
+                return Err(format!("API error: {detail}"));
+            }
+        };
 
         let mut tool_call_id = String::new();
         let mut tool_call_name = String::new();
@@ -86,7 +103,11 @@ impl AiClient {
                     }
                 }
                 Err(e) => {
-                    let _ = response_tx.send(AiResponse::Error(format!("Stream error: {e}")));
+                    let detail = format!("{e:#}");
+                    eprintln!("[TAI] Stream error: {detail}");
+                    let _ = std::fs::write("/tmp/tai_last_request.json", &request_json);
+                    eprintln!("[TAI] Request saved to /tmp/tai_last_request.json");
+                    let _ = response_tx.send(AiResponse::Error(format!("Stream error: {detail}")));
                     return Ok(());
                 }
             }

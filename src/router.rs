@@ -37,6 +37,9 @@ struct QueuedToolCall {
 pub struct InputRouter {
     mode: InputMode,
     ai_input_buffer: String,
+    unified_history: Vec<String>,
+    history_index: Option<usize>,
+    history_draft: String,
     pending_command: Option<PendingCommand>,
     command_history: Vec<String>,
     current_line_buffer: String,
@@ -64,6 +67,9 @@ impl InputRouter {
         InputRouter {
             mode: InputMode::Shell,
             ai_input_buffer: String::new(),
+            unified_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
             pending_command: None,
             command_history: Vec::new(),
             current_line_buffer: String::new(),
@@ -110,11 +116,14 @@ impl InputRouter {
                 if self.ai_bridge.is_some() {
                     self.mode = InputMode::AiPrompt;
                     self.ai_input_buffer.clear();
+                    self.history_index = None;
+                    self.history_draft.clear();
                 }
             }
             InputMode::AiPrompt => {
                 self.mode = InputMode::Shell;
                 self.ai_input_buffer.clear();
+                self.history_index = None;
             }
             _ => {}
         }
@@ -142,9 +151,13 @@ impl InputRouter {
         if query.trim() == "/clear" {
             self.conversation.clear();
             self.ai_input_buffer.clear();
+            self.history_index = None;
             self.mode = InputMode::Shell;
             return;
         }
+
+        self.push_unified_history(&query);
+        self.history_index = None;
 
         let prompt_display = format!(
             "\r\x1b[2K\x1b[1;35m❯ {}\x1b[0m",
@@ -177,6 +190,46 @@ impl InputRouter {
         self.ai_text_buffer.clear();
         self.ai_first_token = true;
         self.mode = InputMode::AiStreaming;
+    }
+
+    pub fn handle_ai_prompt_history_up(&mut self) {
+        if self.mode != InputMode::AiPrompt || self.unified_history.is_empty() {
+            return;
+        }
+        match self.history_index {
+            None => {
+                self.history_draft = self.ai_input_buffer.clone();
+                let idx = self.unified_history.len() - 1;
+                self.history_index = Some(idx);
+                self.ai_input_buffer = self.unified_history[idx].clone();
+            }
+            Some(idx) if idx > 0 => {
+                let new_idx = idx - 1;
+                self.history_index = Some(new_idx);
+                self.ai_input_buffer = self.unified_history[new_idx].clone();
+            }
+            _ => {}
+        }
+    }
+
+    pub fn handle_ai_prompt_history_down(&mut self) {
+        if self.mode != InputMode::AiPrompt {
+            return;
+        }
+        match self.history_index {
+            Some(idx) => {
+                if idx + 1 < self.unified_history.len() {
+                    let new_idx = idx + 1;
+                    self.history_index = Some(new_idx);
+                    self.ai_input_buffer = self.unified_history[new_idx].clone();
+                } else {
+                    self.history_index = None;
+                    self.ai_input_buffer = self.history_draft.clone();
+                    self.history_draft.clear();
+                }
+            }
+            None => {}
+        }
     }
 
     pub fn handle_ai_prompt_cancel(&mut self) {
@@ -382,6 +435,7 @@ impl InputRouter {
                     if self.command_history.len() > 100 {
                         self.command_history.remove(0);
                     }
+                    self.push_unified_history(&self.current_line_buffer.clone());
                     self.current_line_buffer.clear();
                 }
             } else if c == '\x7f' || c == '\x08' {
@@ -389,6 +443,19 @@ impl InputRouter {
             } else if c.is_ascii_graphic() || c == ' ' {
                 self.current_line_buffer.push(c);
             }
+        }
+    }
+
+    fn push_unified_history(&mut self, entry: &str) {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if self.unified_history.last().map_or(true, |last| last != trimmed) {
+            self.unified_history.push(trimmed.to_string());
+        }
+        if self.unified_history.len() > 200 {
+            self.unified_history.remove(0);
         }
     }
 

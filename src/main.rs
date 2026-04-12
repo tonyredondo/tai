@@ -410,6 +410,16 @@ fn main() {
                     {
                         router.handle_ai_prompt_backspace();
                     }
+                    if rl.is_key_pressed(KeyboardKey::KEY_UP)
+                        || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_UP as i32) }
+                    {
+                        router.handle_ai_prompt_history_up();
+                    }
+                    if rl.is_key_pressed(KeyboardKey::KEY_DOWN)
+                        || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_DOWN as i32) }
+                    {
+                        router.handle_ai_prompt_history_down();
+                    }
                     if rl.is_key_pressed(KeyboardKey::KEY_ENTER) && !ctrl {
                         router.handle_ai_prompt_submit(&mut term, &pty);
                     }

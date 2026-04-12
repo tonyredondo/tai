@@ -102,15 +102,69 @@ impl Minimap {
     }
 
     pub fn set_cols(&mut self, cols: u16) {
-        if cols != self.cols {
-            self.cols = cols;
-            self.lines.clear();
-            self.pixel_cache.clear();
-            self.pixel_cache_dirty = true;
-            self.last_cache_line_count = 0;
-            self.current_line_chars = 0;
-            self.max_line_chars = 0;
+        self.cols = cols;
+    }
+
+    pub fn rebuild_from_text(&mut self, text: &str) {
+        self.lines.clear();
+        self.pixel_cache.clear();
+        self.pixel_cache_dirty = true;
+        self.last_cache_line_count = 0;
+        self.current_line_chars = 0;
+        self.max_line_chars = 0;
+        self.current_fg = DEFAULT_FG;
+        self.line_fg = DEFAULT_FG;
+        self.line_has_color = false;
+        self.state = ParserState::Normal;
+        self.escape_buf.clear();
+
+        let cols = self.cols as u32;
+        if cols == 0 {
+            return;
         }
+
+        for line in text.split('\n') {
+            let char_count = line.chars().count() as u32;
+            if char_count == 0 {
+                self.lines.push(LineInfo {
+                    r: DEFAULT_FG.0,
+                    g: DEFAULT_FG.1,
+                    b: DEFAULT_FG.2,
+                    density: 0.0,
+                });
+                continue;
+            }
+
+            if char_count > cols {
+                let full_rows = char_count / cols;
+                let remainder = char_count % cols;
+                for _ in 0..full_rows {
+                    self.lines.push(LineInfo {
+                        r: DEFAULT_FG.0,
+                        g: DEFAULT_FG.1,
+                        b: DEFAULT_FG.2,
+                        density: 1.0,
+                    });
+                }
+                if remainder > 0 {
+                    self.lines.push(LineInfo {
+                        r: DEFAULT_FG.0,
+                        g: DEFAULT_FG.1,
+                        b: DEFAULT_FG.2,
+                        density: remainder as f32 / cols as f32,
+                    });
+                }
+            } else {
+                self.lines.push(LineInfo {
+                    r: DEFAULT_FG.0,
+                    g: DEFAULT_FG.1,
+                    b: DEFAULT_FG.2,
+                    density: (char_count as f32 / cols as f32).min(1.0),
+                });
+            }
+        }
+
+        self.pixel_cache_dirty = true;
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {

@@ -229,6 +229,8 @@ fn main() {
                 term.resize(cols, rows, cell_width as u32, cell_height as u32);
                 pty.resize(cols, rows, cell_width, cell_height);
                 minimap.set_cols(cols);
+                let buffer_text = term.get_buffer_text(0);
+                minimap.rebuild_from_text(&buffer_text);
                 prev_width = w;
                 prev_height = h;
             }
@@ -267,8 +269,18 @@ fn main() {
         let cmd_held = rl.is_key_down(KeyboardKey::KEY_LEFT_SUPER)
             || rl.is_key_down(KeyboardKey::KEY_RIGHT_SUPER);
 
-        if cmd_held && (rl.is_key_pressed(KeyboardKey::KEY_EQUAL) || rl.is_key_pressed(KeyboardKey::KEY_KP_ADD)) {
-            font_size = (font_size + 2).min(72);
+        let font_size_change = if cmd_held && (rl.is_key_pressed(KeyboardKey::KEY_EQUAL) || rl.is_key_pressed(KeyboardKey::KEY_KP_ADD)) {
+            Some((font_size + 2).min(72))
+        } else if cmd_held && (rl.is_key_pressed(KeyboardKey::KEY_MINUS) || rl.is_key_pressed(KeyboardKey::KEY_KP_SUBTRACT)) {
+            Some((font_size - 2).max(8))
+        } else if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_ZERO) {
+            Some(default_font_size)
+        } else {
+            None
+        };
+
+        if let Some(new_size) = font_size_change {
+            font_size = new_size;
             let old_font = mono_font;
             metrics = load_font(font_size, dpi_scale, &mut codepoints);
             mono_font = metrics.font;
@@ -283,40 +295,8 @@ fn main() {
             term.resize(cols, rows, cell_width as u32, cell_height as u32);
             pty.resize(cols, rows, cell_width, cell_height);
             minimap.set_cols(cols);
-        }
-        if cmd_held && (rl.is_key_pressed(KeyboardKey::KEY_MINUS) || rl.is_key_pressed(KeyboardKey::KEY_KP_SUBTRACT)) {
-            font_size = (font_size - 2).max(8);
-            let old_font = mono_font;
-            metrics = load_font(font_size, dpi_scale, &mut codepoints);
-            mono_font = metrics.font;
-            cell_width = metrics.cell_width;
-            cell_height = metrics.cell_height;
-            status_bar_height = font_size + 8;
-            unsafe { raylib::ffi::UnloadFont(old_font); }
-            let w = rl.get_screen_width();
-            let h = rl.get_screen_height();
-            let cols = ((w - 2 * pad - minimap_width) / cell_width).max(1) as u16;
-            let rows = (((h - status_bar_height) - 2 * pad) / cell_height).max(1) as u16;
-            term.resize(cols, rows, cell_width as u32, cell_height as u32);
-            pty.resize(cols, rows, cell_width, cell_height);
-            minimap.set_cols(cols);
-        }
-        if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_ZERO) {
-            font_size = default_font_size;
-            let old_font = mono_font;
-            metrics = load_font(font_size, dpi_scale, &mut codepoints);
-            mono_font = metrics.font;
-            cell_width = metrics.cell_width;
-            cell_height = metrics.cell_height;
-            status_bar_height = font_size + 8;
-            unsafe { raylib::ffi::UnloadFont(old_font); }
-            let w = rl.get_screen_width();
-            let h = rl.get_screen_height();
-            let cols = ((w - 2 * pad - minimap_width) / cell_width).max(1) as u16;
-            let rows = (((h - status_bar_height) - 2 * pad) / cell_height).max(1) as u16;
-            term.resize(cols, rows, cell_width as u32, cell_height as u32);
-            pty.resize(cols, rows, cell_width, cell_height);
-            minimap.set_cols(cols);
+            let buffer_text = term.get_buffer_text(0);
+            minimap.rebuild_from_text(&buffer_text);
         }
 
         // Cmd+C = copy selection, Cmd+V = paste

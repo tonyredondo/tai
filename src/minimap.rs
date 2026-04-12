@@ -102,7 +102,15 @@ impl Minimap {
     }
 
     pub fn set_cols(&mut self, cols: u16) {
-        self.cols = cols;
+        if cols != self.cols {
+            self.cols = cols;
+            self.lines.clear();
+            self.pixel_cache.clear();
+            self.pixel_cache_dirty = true;
+            self.last_cache_line_count = 0;
+            self.current_line_chars = 0;
+            self.max_line_chars = 0;
+        }
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {

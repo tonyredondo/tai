@@ -47,6 +47,7 @@ pub struct InputRouter {
     ai_text_buffer: String,
     command_capture: Option<CommandCapture>,
     tool_call_queue: Vec<QueuedToolCall>,
+    pending_tool_calls: Vec<(String, String, String)>,
     has_pending_dispatch: bool,
     ai_first_token: bool,
     ai_after_command: bool,
@@ -73,6 +74,7 @@ impl InputRouter {
             ai_text_buffer: String::new(),
             command_capture: None,
             tool_call_queue: Vec::new(),
+            pending_tool_calls: Vec::new(),
             has_pending_dispatch: false,
             ai_first_token: false,
             ai_after_command: false,
@@ -201,15 +203,20 @@ impl InputRouter {
         });
 
         if has_end_marker {
+            if let Some(ref c) = self.command_capture {
+                eprintln!("[TAI] End marker found for tool_call_id={}", c.tool_call_id);
+            }
             self.finish_command_capture(terminal, pty);
         }
 
         if self.has_pending_dispatch && self.command_capture.is_none() {
             self.has_pending_dispatch = false;
             if !self.tool_call_queue.is_empty() {
+                eprintln!("[TAI] Dispatching next queued tool call ({} remaining)", self.tool_call_queue.len());
                 self.dispatch_next_tool_call(terminal, pty, overlay);
                 return;
             }
+            eprintln!("[TAI] Queue empty, sending AI request (conversation has {} msgs)", self.conversation.len());
             if let Some(ref bridge) = self.ai_bridge {
                 let cwd = pty.get_cwd().unwrap_or_else(|| PathBuf::from("~"));
                 let os = std::env::consts::OS;
@@ -232,8 +239,6 @@ impl InputRouter {
             None => return,
         };
 
-        let mut batch_tool_calls: Vec<(String, String, String)> = Vec::new();
-
         for response in responses {
             match response {
                 AiResponse::Token(token) => {
@@ -253,12 +258,54 @@ impl InputRouter {
                     terminal.vt_write(colored.as_bytes());
                 }
                 AiResponse::ToolCall { id, name, arguments } => {
-                    batch_tool_calls.push((id, name, arguments));
+                    self.pending_tool_calls.push((id, name, arguments));
                 }
                 AiResponse::Done => {
-                    if !batch_tool_calls.is_empty() || self.command_capture.is_some() {
+                    if self.command_capture.is_some() {
                         continue;
                     }
+
+                    if !self.pending_tool_calls.is_empty() {
+                        let batch = std::mem::take(&mut self.pending_tool_calls);
+                        eprintln!("[TAI] Done: committing {} tool calls as single assistant message", batch.len());
+
+                        if self.ai_after_command {
+                            terminal.vt_write(b"\r\x1b[2K\x1b[A\r\x1b[2K");
+                            self.ai_after_command = false;
+                        }
+
+                        let api_tool_calls: Vec<ChatCompletionMessageToolCall> = batch
+                            .iter()
+                            .map(|(id, name, args)| ChatCompletionMessageToolCall {
+                                id: id.clone(),
+                                r#type: async_openai::types::ChatCompletionToolType::Function,
+                                function: async_openai::types::FunctionCall {
+                                    name: name.clone(),
+                                    arguments: args.clone(),
+                                },
+                            })
+                            .collect();
+                        self.conversation.push_assistant_tool_call(api_tool_calls);
+
+                        for (id, name, arguments) in batch {
+                            if name == "run_command" {
+                                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&arguments) {
+                                    let command = args["command"].as_str().unwrap_or("").to_string();
+                                    let explanation = args["explanation"].as_str().unwrap_or("").to_string();
+                                    self.tool_call_queue.push(QueuedToolCall {
+                                        id,
+                                        name,
+                                        command,
+                                        explanation,
+                                    });
+                                }
+                            }
+                        }
+
+                        self.dispatch_next_tool_call(terminal, pty, overlay);
+                        continue;
+                    }
+
                     if self.ai_after_command {
                         terminal.vt_write(b"\r\x1b[2K\x1b[A\r\x1b[2K");
                         self.ai_after_command = false;
@@ -274,6 +321,7 @@ impl InputRouter {
                     }
                 }
                 AiResponse::Error(err) => {
+                    self.pending_tool_calls.clear();
                     let msg = format!("\r\n\x1b[31mTAI Error: {}\x1b[0m\r\n", err);
                     terminal.vt_write(msg.as_bytes());
                     self.conversation.remove_trailing_orphans();
@@ -281,43 +329,6 @@ impl InputRouter {
                     self.mode = InputMode::Shell;
                 }
             }
-        }
-
-        if !batch_tool_calls.is_empty() {
-            if self.ai_after_command {
-                terminal.vt_write(b"\r\x1b[2K\x1b[A\r\x1b[2K");
-                self.ai_after_command = false;
-            }
-
-            let api_tool_calls: Vec<ChatCompletionMessageToolCall> = batch_tool_calls
-                .iter()
-                .map(|(id, name, args)| ChatCompletionMessageToolCall {
-                    id: id.clone(),
-                    r#type: async_openai::types::ChatCompletionToolType::Function,
-                    function: async_openai::types::FunctionCall {
-                        name: name.clone(),
-                        arguments: args.clone(),
-                    },
-                })
-                .collect();
-            self.conversation.push_assistant_tool_call(api_tool_calls);
-
-            for (id, name, arguments) in batch_tool_calls {
-                if name == "run_command" {
-                    if let Ok(args) = serde_json::from_str::<serde_json::Value>(&arguments) {
-                        let command = args["command"].as_str().unwrap_or("").to_string();
-                        let explanation = args["explanation"].as_str().unwrap_or("").to_string();
-                        self.tool_call_queue.push(QueuedToolCall {
-                            id,
-                            name,
-                            command,
-                            explanation,
-                        });
-                    }
-                }
-            }
-
-            self.dispatch_next_tool_call(terminal, pty, overlay);
         }
     }
 
@@ -342,6 +353,7 @@ impl InputRouter {
             overlay.hide();
             self.conversation.push_tool_result(&pending.tool_call_id, "User cancelled the command.");
             self.tool_call_queue.clear();
+            self.pending_tool_calls.clear();
             pty.write(b"\n");
             self.mode = InputMode::Shell;
         }
@@ -357,6 +369,7 @@ impl InputRouter {
             pty.write(pending.command.as_bytes());
             self.conversation.push_tool_result(&pending.tool_call_id, "User chose to edit the command manually.");
             self.tool_call_queue.clear();
+            self.pending_tool_calls.clear();
             self.mode = InputMode::Shell;
         }
     }
@@ -496,8 +509,10 @@ impl InputRouter {
             "Command output (exit code: {exit_code}):\n{truncated}"
         );
 
+        eprintln!("[TAI] finish_command_capture: pushing tool_result for {} (conversation was {} msgs)", capture.tool_call_id, self.conversation.len());
         self.conversation
             .push_tool_result(&capture.tool_call_id, &result);
+        eprintln!("[TAI] finish_command_capture: conversation now {} msgs, queue={}", self.conversation.len(), self.tool_call_queue.len());
 
         self.ai_first_token = true;
         self.ai_after_command = true;

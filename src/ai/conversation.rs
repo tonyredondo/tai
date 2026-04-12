@@ -98,6 +98,10 @@ impl ConversationHistory {
         msgs
     }
 
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
     pub fn clear(&mut self) {
         self.messages.clear();
     }

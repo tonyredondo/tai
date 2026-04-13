@@ -384,14 +384,14 @@ impl Minimap {
         scrollbar_total: u64,
         scrollbar_offset: u64,
         scrollbar_len: u64,
-        screen_w: i32,
-        screen_h: i32,
-        status_bar_h: i32,
-        _pad: i32,
+        panel_x: i32,
+        panel_y: i32,
+        panel_w: i32,
+        panel_h: i32,
         d: &mut RaylibDrawHandle,
     ) {
-        let minimap_x = screen_w - self.width;
-        let minimap_h = screen_h - status_bar_h;
+        let minimap_x = panel_x + panel_w - self.width;
+        let minimap_h = panel_h;
         if minimap_h <= 0 {
             return;
         }
@@ -400,8 +400,8 @@ impl Minimap {
         let margin = 4;
         let bar_area = self.width - margin * 2;
 
-        d.draw_rectangle(minimap_x, 0, self.width, minimap_h, Color::new(18, 18, 22, 255));
-        d.draw_line(minimap_x, 0, minimap_x, minimap_h, Color::new(45, 45, 50, 255));
+        d.draw_rectangle(minimap_x, panel_y, self.width, minimap_h, Color::new(18, 18, 22, 255));
+        d.draw_line(minimap_x, panel_y, minimap_x, panel_y + minimap_h, Color::new(45, 45, 50, 255));
 
         if self.pixel_cache_dirty
             || self.lines.len() != self.last_cache_line_count
@@ -416,8 +416,8 @@ impl Minimap {
             if pixel.alpha == 0 {
                 continue;
             }
-            let y = i as i32 * row_h;
-            let in_viewport = indicator_h > 0 && y + row_h > indicator_y && y < indicator_y + indicator_h;
+            let y = panel_y + i as i32 * row_h;
+            let in_viewport = indicator_h > 0 && (y - panel_y) + row_h > indicator_y && (y - panel_y) < indicator_y + indicator_h;
 
             let bar_w = ((pixel.density * bar_area as f32).max(2.0)) as i32;
             let base_alpha = if in_viewport { pixel.alpha } else { pixel.alpha / 2 };
@@ -425,7 +425,7 @@ impl Minimap {
                 minimap_x + margin,
                 y,
                 bar_w.min(bar_area),
-                row_h.min(minimap_h - y),
+                row_h.min(panel_y + minimap_h - y),
                 Color::new(140, 150, 170, base_alpha),
             );
         }
@@ -433,7 +433,7 @@ impl Minimap {
         if indicator_h > 0 {
             d.draw_rectangle(
                 minimap_x + 1,
-                indicator_y,
+                panel_y + indicator_y,
                 self.width - 2,
                 indicator_h,
                 Color::new(200, 210, 230, 18),
@@ -444,8 +444,8 @@ impl Minimap {
             } else {
                 Color::new(100, 110, 135, 160)
             };
-            d.draw_rectangle(minimap_x + 1, indicator_y, self.width - 2, 1, line_color);
-            d.draw_rectangle(minimap_x + 1, indicator_y + indicator_h - 1, self.width - 2, 1, line_color);
+            d.draw_rectangle(minimap_x + 1, panel_y + indicator_y, self.width - 2, 1, line_color);
+            d.draw_rectangle(minimap_x + 1, panel_y + indicator_y + indicator_h - 1, self.width - 2, 1, line_color);
         }
     }
 
@@ -467,26 +467,27 @@ impl Minimap {
     pub fn handle_mouse_press(
         &mut self,
         mouse_y: i32,
-        screen_h: i32,
-        status_bar_h: i32,
+        panel_y: i32,
+        panel_h: i32,
         scrollbar_total: u64,
         scrollbar_offset: u64,
         scrollbar_len: u64,
     ) -> i32 {
-        let minimap_h = screen_h - status_bar_h;
+        let minimap_h = panel_h;
         if minimap_h <= 0 || scrollbar_total <= scrollbar_len {
             return 0;
         }
 
+        let local_y = mouse_y - panel_y;
         let (ind_y, ind_h) = self.indicator_rect(scrollbar_total, scrollbar_offset, scrollbar_len, minimap_h);
 
-        if mouse_y >= ind_y && mouse_y <= ind_y + ind_h {
+        if local_y >= ind_y && local_y <= ind_y + ind_h {
             self.dragging = true;
-            self.drag_offset = mouse_y as f64 - ind_y as f64;
+            self.drag_offset = local_y as f64 - ind_y as f64;
             return 0;
         }
 
-        let frac = (mouse_y as f64 / minimap_h as f64).clamp(0.0, 1.0);
+        let frac = (local_y as f64 / minimap_h as f64).clamp(0.0, 1.0);
         let scrollable = scrollbar_total - scrollbar_len;
         let target = (frac * scrollable as f64) as i64;
         (target - scrollbar_offset as i64) as i32
@@ -495,8 +496,8 @@ impl Minimap {
     pub fn handle_mouse_drag(
         &self,
         mouse_y: i32,
-        screen_h: i32,
-        status_bar_h: i32,
+        panel_y: i32,
+        panel_h: i32,
         scrollbar_total: u64,
         scrollbar_offset: u64,
         scrollbar_len: u64,
@@ -504,11 +505,12 @@ impl Minimap {
         if !self.dragging {
             return 0;
         }
-        let minimap_h = screen_h - status_bar_h;
+        let minimap_h = panel_h;
         if minimap_h <= 0 || scrollbar_total <= scrollbar_len {
             return 0;
         }
 
+        let local_y = mouse_y - panel_y;
         let scrollable = scrollbar_total - scrollbar_len;
         let (_, ind_h) = self.indicator_rect(scrollbar_total, scrollbar_offset, scrollbar_len, minimap_h);
         let track_h = (minimap_h - ind_h) as f64;
@@ -516,7 +518,7 @@ impl Minimap {
             return 0;
         }
 
-        let top_y = (mouse_y as f64 - self.drag_offset).clamp(0.0, track_h);
+        let top_y = (local_y as f64 - self.drag_offset).clamp(0.0, track_h);
         let frac = top_y / track_h;
         let target = (frac * scrollable as f64) as i64;
         (target - scrollbar_offset as i64) as i32

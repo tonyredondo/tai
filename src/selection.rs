@@ -85,7 +85,8 @@ impl TextSelection {
         &self,
         cell_width: i32,
         cell_height: i32,
-        pad: i32,
+        pad_x: i32,
+        pad_y: i32,
         term_cols: i32,
         term_rows: i32,
         d: &mut RaylibDrawHandle,
@@ -105,8 +106,8 @@ impl TextSelection {
             let col_start = if row == s.row { s.col } else { 0 };
             let col_end = if row == e.row { e.col } else { term_cols - 1 };
 
-            let x = pad + col_start * cell_width;
-            let y = pad + row * cell_height;
+            let x = pad_x + col_start * cell_width;
+            let y = pad_y + row * cell_height;
             let w = (col_end - col_start + 1) * cell_width;
 
             d.draw_rectangle(x, y, w, cell_height, highlight);
@@ -114,9 +115,9 @@ impl TextSelection {
     }
 }
 
-pub fn mouse_to_cell(mouse_x: i32, mouse_y: i32, cell_width: i32, cell_height: i32, pad: i32) -> (i32, i32) {
-    let col = (mouse_x - pad) / cell_width;
-    let row = (mouse_y - pad) / cell_height;
+pub fn mouse_to_cell(mouse_x: i32, mouse_y: i32, cell_width: i32, cell_height: i32, pad_x: i32, pad_y: i32) -> (i32, i32) {
+    let col = (mouse_x - pad_x) / cell_width;
+    let row = (mouse_y - pad_y) / cell_height;
     (col.max(0), row.max(0))
 }
 

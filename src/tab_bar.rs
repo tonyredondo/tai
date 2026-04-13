@@ -22,31 +22,31 @@ impl TabBar {
         self.height = cell_height + 14;
     }
 
-    pub fn handle_click(&self, mx: i32, _my: i32, screen_w: i32, tab_count: usize) -> TabBarAction {
-        let tab_w = self.tab_width(tab_count, screen_w);
+    pub fn handle_click(&self, local_mx: i32, _local_my: i32, bar_width: i32, tab_count: usize) -> TabBarAction {
+        let tab_w = self.tab_width(tab_count, bar_width);
         let new_btn_x = (tab_count as i32) * tab_w;
 
-        if mx >= new_btn_x && mx < new_btn_x + self.height {
+        if local_mx >= new_btn_x && local_mx < new_btn_x + self.height {
             return TabBarAction::New;
         }
 
-        let tab_idx = (mx / tab_w) as usize;
+        let tab_idx = (local_mx / tab_w) as usize;
         if tab_idx >= tab_count {
             return TabBarAction::None;
         }
 
         let close_x = (tab_idx as i32 + 1) * tab_w - self.height;
-        if mx >= close_x {
+        if local_mx >= close_x {
             return TabBarAction::Close(tab_idx);
         }
 
         TabBarAction::SwitchTo(tab_idx)
     }
 
-    fn tab_width(&self, tab_count: usize, screen_w: i32) -> i32 {
+    fn tab_width(&self, tab_count: usize, bar_width: i32) -> i32 {
         let max_tab_w = 280;
         let btn_zone = self.height + 8;
-        let available = screen_w - btn_zone;
+        let available = bar_width - btn_zone;
         let per_tab = if tab_count > 0 {
             available / tab_count as i32
         } else {
@@ -61,19 +61,21 @@ impl TabBar {
         active: usize,
         font: &raylib::ffi::Font,
         font_size: i32,
-        screen_w: i32,
+        offset_x: i32,
+        offset_y: i32,
+        bar_width: i32,
         d: &mut RaylibDrawHandle,
     ) {
         let h = self.height;
-        d.draw_rectangle(0, 0, screen_w, h, Color::new(22, 22, 28, 255));
-        d.draw_rectangle(0, h - 1, screen_w, 1, Color::new(45, 45, 55, 255));
+        d.draw_rectangle(offset_x, offset_y, bar_width, h, Color::new(22, 22, 28, 255));
+        d.draw_rectangle(offset_x, offset_y + h - 1, bar_width, 1, Color::new(45, 45, 55, 255));
 
         let tab_count = titles.len();
-        let tab_w = self.tab_width(tab_count, screen_w);
+        let tab_w = self.tab_width(tab_count, bar_width);
         let label_size = (font_size - 2).max(8);
 
         for (i, title) in titles.iter().enumerate() {
-            let x = i as i32 * tab_w;
+            let x = offset_x + i as i32 * tab_w;
             let is_active = i == active;
 
             let bg = if is_active {
@@ -81,13 +83,13 @@ impl TabBar {
             } else {
                 Color::new(26, 26, 32, 255)
             };
-            d.draw_rectangle(x, 0, tab_w, h, bg);
+            d.draw_rectangle(x, offset_y, tab_w, h, bg);
 
             if is_active {
-                d.draw_rectangle(x, h - 2, tab_w, 2, Color::new(80, 140, 220, 255));
+                d.draw_rectangle(x, offset_y + h - 2, tab_w, 2, Color::new(80, 140, 220, 255));
             }
 
-            d.draw_rectangle(x + tab_w - 1, 2, 1, h - 4, Color::new(45, 45, 55, 200));
+            d.draw_rectangle(x + tab_w - 1, offset_y + 2, 1, h - 4, Color::new(45, 45, 55, 200));
 
             let max_chars = ((tab_w - self.height - 14) / (label_size / 2 + 1)).max(1) as usize;
             let label: String = if title.len() > max_chars {
@@ -109,7 +111,7 @@ impl TabBar {
                     c_label.as_ptr(),
                     raylib::ffi::Vector2 {
                         x: (x + 14) as f32,
-                        y: ((h - label_size) / 2) as f32,
+                        y: (offset_y + (h - label_size) / 2) as f32,
                     },
                     label_size as f32,
                     0.0,
@@ -118,7 +120,7 @@ impl TabBar {
             }
 
             let close_x = x + tab_w - self.height;
-            let close_y = (h - label_size) / 2;
+            let close_y = offset_y + (h - label_size) / 2;
             let close_color = if is_active {
                 raylib::ffi::Color { r: 160, g: 160, b: 170, a: 180 }
             } else {
@@ -140,7 +142,7 @@ impl TabBar {
             }
         }
 
-        let plus_x = tab_count as i32 * tab_w;
+        let plus_x = offset_x + tab_count as i32 * tab_w;
         let c_plus = std::ffi::CString::new("+").unwrap_or_default();
         unsafe {
             raylib::ffi::DrawTextEx(
@@ -148,7 +150,7 @@ impl TabBar {
                 c_plus.as_ptr(),
                 raylib::ffi::Vector2 {
                     x: (plus_x + 10) as f32,
-                    y: ((h - label_size) / 2) as f32,
+                    y: (offset_y + (h - label_size) / 2) as f32,
                 },
                 label_size as f32,
                 0.0,

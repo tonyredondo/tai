@@ -10,6 +10,7 @@ mod minimap;
 mod overlay;
 mod router;
 mod selection;
+mod split;
 mod status_bar;
 mod tab;
 mod tab_bar;
@@ -18,9 +19,10 @@ mod terminal;
 use config::TaiConfig;
 use router::InputMode;
 use selection::TextSelection;
+use split::{SplitDirection, SplitNode, PanelRect, alloc_panel_id, create_panel, panel_term_size};
 use status_bar::StatusBar;
 use tab::TabSession;
-use tab_bar::{TabBar, TabBarAction};
+use tab_bar::TabBarAction;
 use raylib::prelude::*;
 
 const FONT_DATA: &[u8] = include_bytes!("../fonts/JetBrainsMono-Regular.ttf");
@@ -138,10 +140,23 @@ fn extract_selected_text(sel: &TextSelection, rows: &[String]) -> String {
     result
 }
 
-fn calc_term_size(w: i32, h: i32, pad: i32, minimap_width: i32, tab_bar_height: i32, status_bar_height: i32, cell_width: i32, cell_height: i32) -> (u16, u16) {
-    let cols = ((w - 2 * pad - minimap_width) / cell_width).max(1) as u16;
-    let rows = (((h - status_bar_height - tab_bar_height) - 2 * pad) / cell_height).max(1) as u16;
-    (cols, rows)
+fn relayout_and_resize(
+    root: &mut SplitNode,
+    scr_w: i32,
+    scr_h: i32,
+    status_bar_height: i32,
+    pad: i32,
+    minimap_width: i32,
+    cell_width: i32,
+    cell_height: i32,
+) {
+    root.layout(PanelRect { x: 0, y: 0, w: scr_w, h: scr_h - status_bar_height });
+    root.for_each_panel_mut(&mut |panel| {
+        let (cols, rows) = panel_term_size(&panel.rect, pad, minimap_width, panel.tab_bar.height, cell_width, cell_height);
+        for tab in &mut panel.tabs {
+            tab.resize(cols, rows, cell_width as u32, cell_height as u32);
+        }
+    });
 }
 
 fn main() {
@@ -177,25 +192,32 @@ fn main() {
     let pad = 4;
     let minimap_width = 40;
     let mut status_bar_height = font_size + 8;
-    let mut tab_bar = TabBar::new(cell_height);
-    let tab_bar_height = tab_bar.height;
 
     let scr_w = rl.get_screen_width();
     let scr_h = rl.get_screen_height();
-    let (term_cols, term_rows) = calc_term_size(scr_w, scr_h, pad, minimap_width, tab_bar_height, status_bar_height, cell_width, cell_height);
 
     let ai_available = config.api_key().is_some();
     let status_bar = StatusBar::new(&config.ai.model, ai_available);
 
-    let mut tabs: Vec<TabSession> = Vec::new();
-    match TabSession::new(&config, term_cols, term_rows, cell_width, cell_height) {
-        Ok(t) => tabs.push(t),
+    let mut next_panel_id: u32 = 0;
+    let initial_id = alloc_panel_id(&mut next_panel_id);
+
+    let initial_rect = PanelRect { x: 0, y: 0, w: scr_w, h: scr_h - status_bar_height };
+    let tab_bar_height = cell_height + 14;
+    let (term_cols, term_rows) = panel_term_size(&initial_rect, pad, minimap_width, tab_bar_height, cell_width, cell_height);
+
+    let mut root = match create_panel(initial_id, &config, term_cols, term_rows, cell_width, cell_height) {
+        Ok(panel) => {
+            let mut node = SplitNode::Leaf(panel);
+            node.layout(initial_rect);
+            node
+        }
         Err(e) => {
-            eprintln!("Failed to create tab: {e}");
+            eprintln!("Failed to create initial panel: {e}");
             return;
         }
-    }
-    let mut active_tab: usize = 0;
+    };
+    let mut focused_panel_id: u32 = initial_id;
 
     let mut prev_width = scr_w;
     let mut prev_height = scr_h;
@@ -204,49 +226,44 @@ fn main() {
 
     unsafe { raylib::ffi::SetExitKey(0); }
 
-    while !rl.window_should_close() {
-        if tabs.is_empty() {
-            break;
-        }
+    let mut app_exit = false;
+    let mut show_help = false;
 
+    while !rl.window_should_close() && !app_exit {
         // Handle resize
         if rl.is_window_resized() {
             let w = rl.get_screen_width();
             let h = rl.get_screen_height();
             if w != prev_width || h != prev_height {
-                let (cols, rows) = calc_term_size(w, h, pad, minimap_width, tab_bar.height, status_bar_height, cell_width, cell_height);
-                for tab in &mut tabs {
-                    tab.resize(cols, rows, cell_width as u32, cell_height as u32);
-                }
+                relayout_and_resize(&mut root, w, h, status_bar_height, pad, minimap_width, cell_width, cell_height);
                 prev_width = w;
                 prev_height = h;
             }
         }
 
-        // Read PTY for ALL tabs
-        for tab in &mut tabs {
-            tab.read_pty();
-        }
+        // Read PTY and poll AI for ALL panels/tabs
+        root.for_each_panel_mut(&mut |panel| {
+            for tab in &mut panel.tabs {
+                tab.read_pty();
+                tab.poll_ai();
+            }
+        });
 
-        // Poll AI for ALL tabs
-        for tab in &mut tabs {
-            tab.poll_ai();
-        }
-
-        // Update window title from active tab (~every 30 frames)
+        // Update window title from focused panel's active tab
         title_frame += 1;
         if title_frame % 30 == 0 {
-            let tab = &tabs[active_tab];
-            let tab_title = tab.title();
-            let new_title = if tab_title == "shell" {
-                "Terminal AI".to_string()
-            } else {
-                format!("Terminal AI - {}", tab_title)
-            };
-            if new_title != last_title {
-                let c_title = std::ffi::CString::new(new_title.as_str()).unwrap_or_default();
-                unsafe { raylib::ffi::SetWindowTitle(c_title.as_ptr()); }
-                last_title = new_title;
+            if let Some(panel) = root.panel_by_id(focused_panel_id) {
+                let tab_title = panel.active_tab().title();
+                let new_title = if tab_title == "shell" {
+                    "Terminal AI".to_string()
+                } else {
+                    format!("Terminal AI - {}", tab_title)
+                };
+                if new_title != last_title {
+                    let c_title = std::ffi::CString::new(new_title.as_str()).unwrap_or_default();
+                    unsafe { raylib::ffi::SetWindowTitle(c_title.as_ptr()); }
+                    last_title = new_title;
+                }
             }
         }
 
@@ -257,51 +274,181 @@ fn main() {
             || rl.is_key_down(KeyboardKey::KEY_RIGHT_SHIFT);
         let ctrl_held = rl.is_key_down(KeyboardKey::KEY_LEFT_CONTROL)
             || rl.is_key_down(KeyboardKey::KEY_RIGHT_CONTROL);
+        let alt_held = rl.is_key_down(KeyboardKey::KEY_LEFT_ALT)
+            || rl.is_key_down(KeyboardKey::KEY_RIGHT_ALT);
 
-        // Tab management keybindings
-        if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_T) {
-            let (cols, rows) = calc_term_size(
-                rl.get_screen_width(), rl.get_screen_height(),
-                pad, minimap_width, tab_bar.height, status_bar_height,
-                cell_width, cell_height,
-            );
-            if let Ok(t) = TabSession::new(&config, cols, rows, cell_width, cell_height) {
-                tabs.push(t);
-                active_tab = tabs.len() - 1;
+        // Help panel toggle (F1)
+        if rl.is_key_pressed(KeyboardKey::KEY_F1) {
+            show_help = !show_help;
+        } else if show_help && rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
+            show_help = false;
+        }
+
+        if show_help {
+            // swallow all input while help is visible
+            loop {
+                if unsafe { raylib::ffi::GetCharPressed() } == 0 { break; }
             }
-        } else if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_W) {
-            tabs.remove(active_tab);
-            if tabs.is_empty() {
-                break;
+        }
+
+        // Split keybindings (Cmd+D, Cmd+Shift+D, Cmd+Shift+W, Cmd+Option+Arrows)
+        let mut did_split_action = false;
+        if show_help {
+            // all input blocked while help is open
+        } else if cmd_held && !shift_held && rl.is_key_pressed(KeyboardKey::KEY_D) {
+            let new_id = alloc_panel_id(&mut next_panel_id);
+            if let Some(fp) = root.panel_by_id(focused_panel_id) {
+                let tbh = fp.tab_bar.height;
+                let r = fp.rect;
+                let (cols, rows) = panel_term_size(&PanelRect { x: 0, y: 0, w: r.w / 2, h: r.h }, pad, minimap_width, tbh, cell_width, cell_height);
+                if let Ok(new_panel) = create_panel(new_id, &config, cols, rows, cell_width, cell_height) {
+                    root.split_panel(focused_panel_id, SplitDirection::Horizontal, new_panel);
+                    let scr_w = rl.get_screen_width();
+                    let scr_h = rl.get_screen_height();
+                    relayout_and_resize(&mut root, scr_w, scr_h, status_bar_height, pad, minimap_width, cell_width, cell_height);
+                    focused_panel_id = new_id;
+                    last_title.clear();
+                }
             }
-            active_tab = active_tab.min(tabs.len() - 1);
-            last_title.clear();
-        } else if cmd_held && shift_held && rl.is_key_pressed(KeyboardKey::KEY_RIGHT_BRACKET) {
-            active_tab = (active_tab + 1) % tabs.len();
-            last_title.clear();
-        } else if cmd_held && shift_held && rl.is_key_pressed(KeyboardKey::KEY_LEFT_BRACKET) {
-            active_tab = if active_tab == 0 { tabs.len() - 1 } else { active_tab - 1 };
-            last_title.clear();
+            did_split_action = true;
+        } else if cmd_held && shift_held && rl.is_key_pressed(KeyboardKey::KEY_D) {
+            let new_id = alloc_panel_id(&mut next_panel_id);
+            if let Some(fp) = root.panel_by_id(focused_panel_id) {
+                let tbh = fp.tab_bar.height;
+                let r = fp.rect;
+                let (cols, rows) = panel_term_size(&PanelRect { x: 0, y: 0, w: r.w, h: r.h / 2 }, pad, minimap_width, tbh, cell_width, cell_height);
+                if let Ok(new_panel) = create_panel(new_id, &config, cols, rows, cell_width, cell_height) {
+                    root.split_panel(focused_panel_id, SplitDirection::Vertical, new_panel);
+                    let scr_w = rl.get_screen_width();
+                    let scr_h = rl.get_screen_height();
+                    relayout_and_resize(&mut root, scr_w, scr_h, status_bar_height, pad, minimap_width, cell_width, cell_height);
+                    focused_panel_id = new_id;
+                    last_title.clear();
+                }
+            }
+            did_split_action = true;
+        } else if cmd_held && shift_held && rl.is_key_pressed(KeyboardKey::KEY_W) {
+            if root.panel_count() > 1 {
+                let leaves = root.collect_leaves();
+                let idx = leaves.iter().position(|&id| id == focused_panel_id).unwrap_or(0);
+                root.close_panel(focused_panel_id);
+                let new_leaves = root.collect_leaves();
+                focused_panel_id = new_leaves[idx.min(new_leaves.len() - 1)];
+                let scr_w = rl.get_screen_width();
+                let scr_h = rl.get_screen_height();
+                relayout_and_resize(&mut root, scr_w, scr_h, status_bar_height, pad, minimap_width, cell_width, cell_height);
+                last_title.clear();
+            }
+            did_split_action = true;
+        } else if cmd_held && alt_held && rl.is_key_pressed(KeyboardKey::KEY_RIGHT) {
+            let leaves = root.collect_leaves();
+            if let Some(idx) = leaves.iter().position(|&id| id == focused_panel_id) {
+                focused_panel_id = leaves[(idx + 1) % leaves.len()];
+                last_title.clear();
+            }
+            did_split_action = true;
+        } else if cmd_held && alt_held && rl.is_key_pressed(KeyboardKey::KEY_LEFT) {
+            let leaves = root.collect_leaves();
+            if let Some(idx) = leaves.iter().position(|&id| id == focused_panel_id) {
+                focused_panel_id = leaves[if idx == 0 { leaves.len() - 1 } else { idx - 1 }];
+                last_title.clear();
+            }
+            did_split_action = true;
+        } else if cmd_held && alt_held && rl.is_key_pressed(KeyboardKey::KEY_DOWN) {
+            let leaves = root.collect_leaves();
+            if let Some(idx) = leaves.iter().position(|&id| id == focused_panel_id) {
+                focused_panel_id = leaves[(idx + 1) % leaves.len()];
+                last_title.clear();
+            }
+            did_split_action = true;
+        } else if cmd_held && alt_held && rl.is_key_pressed(KeyboardKey::KEY_UP) {
+            let leaves = root.collect_leaves();
+            if let Some(idx) = leaves.iter().position(|&id| id == focused_panel_id) {
+                focused_panel_id = leaves[if idx == 0 { leaves.len() - 1 } else { idx - 1 }];
+                last_title.clear();
+            }
+            did_split_action = true;
+        }
+
+        if did_split_action {
+            // skip other keybindings this frame
         } else {
-            // Cmd+1..9 jump to tab
-            let mut tab_jump = false;
-            if cmd_held {
+            // Tab management keybindings (scoped to focused panel)
+            let mut tab_action_done = false;
+            if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_T) {
+                if let Some(panel) = root.panel_by_id_mut(focused_panel_id) {
+                    let (cols, rows) = panel_term_size(&panel.rect, pad, minimap_width, panel.tab_bar.height, cell_width, cell_height);
+                    if let Ok(t) = TabSession::new(&config, cols, rows, cell_width, cell_height) {
+                        panel.tabs.push(t);
+                        panel.active_tab = panel.tabs.len() - 1;
+                        last_title.clear();
+                    }
+                }
+                tab_action_done = true;
+            } else if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_W) {
+                if let Some(panel) = root.panel_by_id_mut(focused_panel_id) {
+                    panel.tabs.remove(panel.active_tab);
+                    if panel.tabs.is_empty() {
+                        if root.panel_count() <= 1 {
+                            app_exit = true;
+                        }
+                        // will close panel below
+                    } else {
+                        panel.active_tab = panel.active_tab.min(panel.tabs.len() - 1);
+                        last_title.clear();
+                    }
+                }
+                // If the panel became empty and there are other panels, close it
+                let should_close = root.panel_by_id(focused_panel_id)
+                    .map(|p| p.tabs.is_empty())
+                    .unwrap_or(false);
+                if should_close && !app_exit && root.panel_count() > 1 {
+                    let leaves = root.collect_leaves();
+                    let idx = leaves.iter().position(|&id| id == focused_panel_id).unwrap_or(0);
+                    root.close_panel(focused_panel_id);
+                    let new_leaves = root.collect_leaves();
+                    focused_panel_id = new_leaves[idx.min(new_leaves.len() - 1)];
+                    let scr_w = rl.get_screen_width();
+                    let scr_h = rl.get_screen_height();
+                    relayout_and_resize(&mut root, scr_w, scr_h, status_bar_height, pad, minimap_width, cell_width, cell_height);
+                    last_title.clear();
+                }
+                tab_action_done = true;
+            } else if cmd_held && shift_held && rl.is_key_pressed(KeyboardKey::KEY_RIGHT_BRACKET) {
+                if let Some(panel) = root.panel_by_id_mut(focused_panel_id) {
+                    panel.active_tab = (panel.active_tab + 1) % panel.tabs.len();
+                    last_title.clear();
+                }
+                tab_action_done = true;
+            } else if cmd_held && shift_held && rl.is_key_pressed(KeyboardKey::KEY_LEFT_BRACKET) {
+                if let Some(panel) = root.panel_by_id_mut(focused_panel_id) {
+                    panel.active_tab = if panel.active_tab == 0 { panel.tabs.len() - 1 } else { panel.active_tab - 1 };
+                    last_title.clear();
+                }
+                tab_action_done = true;
+            } else if cmd_held {
                 let key_nums = [
                     KeyboardKey::KEY_ONE, KeyboardKey::KEY_TWO, KeyboardKey::KEY_THREE,
                     KeyboardKey::KEY_FOUR, KeyboardKey::KEY_FIVE, KeyboardKey::KEY_SIX,
                     KeyboardKey::KEY_SEVEN, KeyboardKey::KEY_EIGHT, KeyboardKey::KEY_NINE,
                 ];
                 for (i, &key) in key_nums.iter().enumerate() {
-                    if rl.is_key_pressed(key) && i < tabs.len() {
-                        active_tab = i;
-                        last_title.clear();
-                        tab_jump = true;
-                        break;
+                    if rl.is_key_pressed(key) {
+                        if let Some(panel) = root.panel_by_id_mut(focused_panel_id) {
+                            if i < panel.tabs.len() {
+                                panel.active_tab = i;
+                                last_title.clear();
+                                tab_action_done = true;
+                                break;
+                            }
+                        }
                     }
                 }
             }
 
-            if !tab_jump {
+            if app_exit {
+                // pass through to exit
+            } else if !tab_action_done {
                 // Font size change
                 let font_size_change = if cmd_held && (rl.is_key_pressed(KeyboardKey::KEY_EQUAL) || rl.is_key_pressed(KeyboardKey::KEY_KP_ADD)) {
                     Some((font_size + 2).min(72))
@@ -321,180 +468,242 @@ fn main() {
                     cell_width = metrics.cell_width;
                     cell_height = metrics.cell_height;
                     status_bar_height = font_size + 8;
-                    tab_bar.update_height(cell_height);
+                    root.for_each_panel_mut(&mut |panel| {
+                        panel.tab_bar.update_height(cell_height);
+                    });
                     unsafe { raylib::ffi::UnloadFont(old_font); }
                     let w = rl.get_screen_width();
                     let h = rl.get_screen_height();
-                    let (cols, rows) = calc_term_size(w, h, pad, minimap_width, tab_bar.height, status_bar_height, cell_width, cell_height);
-                    for tab in &mut tabs {
-                        tab.resize(cols, rows, cell_width as u32, cell_height as u32);
+                    relayout_and_resize(&mut root, w, h, status_bar_height, pad, minimap_width, cell_width, cell_height);
+                }
+
+                // Copy/Paste (focused panel's active tab)
+                if let Some(panel) = root.panel_by_id_mut(focused_panel_id) {
+                    let tab = panel.active_tab_mut();
+                    if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_C) {
+                        if tab.selection.has_selection() {
+                            let rows = tab.term.get_viewport_rows();
+                            let selected = extract_selected_text(&tab.selection, &rows);
+                            if !selected.is_empty() {
+                                selection::copy_to_clipboard(&selected);
+                            }
+                            tab.selection.clear();
+                        }
+                    }
+                    if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_V) {
+                        if let Some(text) = selection::paste_from_clipboard() {
+                            if !text.is_empty() {
+                                tab.pty.write(text.as_bytes());
+                            }
+                        }
                     }
                 }
 
-                // Copy/Paste (active tab)
-                let tab = &mut tabs[active_tab];
-                if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_C) {
-                    if tab.selection.has_selection() {
-                        let rows = tab.term.get_viewport_rows();
-                        let selected = extract_selected_text(&tab.selection, &rows);
-                        if !selected.is_empty() {
-                            selection::copy_to_clipboard(&selected);
-                        }
-                        tab.selection.clear();
-                    }
-                }
-                if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_V) {
-                    if let Some(text) = selection::paste_from_clipboard() {
-                        if !text.is_empty() {
-                            tab.pty.write(text.as_bytes());
-                        }
-                    }
-                }
-
-                // Mouse handling
+                // Mouse handling -- route to hovered panel
                 {
                     let mx = rl.get_mouse_x();
                     let my = rl.get_mouse_y();
-                    let scr_w_now = rl.get_screen_width();
-                    let scr_h_now = rl.get_screen_height();
 
-                    if my < tab_bar.height {
-                        // Tab bar area
-                        if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
-                            match tab_bar.handle_click(mx, my, scr_w_now, tabs.len()) {
-                                TabBarAction::SwitchTo(idx) => {
-                                    active_tab = idx;
-                                    last_title.clear();
-                                }
-                                TabBarAction::Close(idx) => {
-                                    tabs.remove(idx);
-                                    if tabs.is_empty() {
-                                        break;
-                                    }
-                                    active_tab = active_tab.min(tabs.len() - 1);
-                                    last_title.clear();
-                                }
-                                TabBarAction::New => {
-                                    let (cols, rows) = calc_term_size(
-                                        scr_w_now, scr_h_now, pad, minimap_width,
-                                        tab_bar.height, status_bar_height, cell_width, cell_height,
-                                    );
-                                    if let Ok(t) = TabSession::new(&config, cols, rows, cell_width, cell_height) {
-                                        tabs.push(t);
-                                        active_tab = tabs.len() - 1;
-                                        last_title.clear();
-                                    }
-                                }
-                                TabBarAction::None => {}
-                            }
+                    // Check if any panel's minimap is being dragged
+                    let mut dragging_panel_id: Option<u32> = None;
+                    root.for_each_panel(&mut |panel| {
+                        let tab = &panel.tabs[panel.active_tab];
+                        if tab.minimap.dragging {
+                            dragging_panel_id = Some(panel.id);
                         }
+                    });
+
+                    let hover_panel_id = if let Some(drag_id) = dragging_panel_id {
+                        Some(drag_id)
                     } else {
-                        let tab = &mut tabs[active_tab];
-                        let mut mouse_tracking = false;
-                        unsafe {
-                            bindings::ghostty_terminal_get(
-                                tab.term.handle(),
-                                bindings::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING,
-                                &mut mouse_tracking as *mut bool as *mut std::ffi::c_void,
-                            );
-                        }
-                        let in_minimap = mx >= scr_w_now - tab.minimap.width;
+                        root.find_panel_at(mx, my).map(|p| p.id)
+                    };
 
-                        if in_minimap || tab.minimap.dragging {
-                            if let Some((total, offset, len)) = tab.term.get_scrollbar() {
+                    if let Some(hpid) = hover_panel_id {
+                        if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
+                            focused_panel_id = hpid;
+                        }
+
+                        if let Some(panel) = root.panel_by_id_mut(hpid) {
+                            let r = panel.rect;
+                            let local_mx = mx - r.x;
+                            let local_my = my - r.y;
+                            let tab_bar_h = panel.tab_bar.height;
+                            let tab_count = panel.tabs.len();
+
+                            if local_my < tab_bar_h {
+                                // Tab bar area
                                 if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
-                                    let delta = tab.minimap.handle_mouse_press(my, scr_h_now, status_bar_height + tab_bar.height, total, offset, len);
-                                    if delta != 0 { tab.term.scroll_viewport(delta); }
-                                } else if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) && tab.minimap.dragging {
-                                    let delta = tab.minimap.handle_mouse_drag(my, scr_h_now, status_bar_height + tab_bar.height, total, offset, len);
-                                    if delta != 0 { tab.term.scroll_viewport(delta); }
+                                    match panel.tab_bar.handle_click(local_mx, local_my, r.w, tab_count) {
+                                        TabBarAction::SwitchTo(idx) => {
+                                            panel.active_tab = idx;
+                                            last_title.clear();
+                                        }
+                                        TabBarAction::Close(idx) => {
+                                            panel.tabs.remove(idx);
+                                            if panel.tabs.is_empty() {
+                                                // handled after this block
+                                            } else {
+                                                panel.active_tab = panel.active_tab.min(panel.tabs.len() - 1);
+                                                last_title.clear();
+                                            }
+                                        }
+                                        TabBarAction::New => {
+                                            let (cols, rows) = panel_term_size(&r, pad, minimap_width, tab_bar_h, cell_width, cell_height);
+                                            if let Ok(t) = TabSession::new(&config, cols, rows, cell_width, cell_height) {
+                                                panel.tabs.push(t);
+                                                panel.active_tab = panel.tabs.len() - 1;
+                                                last_title.clear();
+                                            }
+                                        }
+                                        TabBarAction::None => {}
+                                    }
+                                }
+                            } else {
+                                let tab = &mut panel.tabs[panel.active_tab];
+                                let mut mouse_tracking = false;
+                                unsafe {
+                                    bindings::ghostty_terminal_get(
+                                        tab.term.handle(),
+                                        bindings::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING,
+                                        &mut mouse_tracking as *mut bool as *mut std::ffi::c_void,
+                                    );
+                                }
+                                let in_minimap = local_mx >= r.w - tab.minimap.width;
+                                let content_y = r.y + tab_bar_h;
+                                let content_h = r.h - tab_bar_h;
+
+                                if in_minimap || tab.minimap.dragging {
+                                    if let Some((total, offset, len)) = tab.term.get_scrollbar() {
+                                        if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
+                                            let delta = tab.minimap.handle_mouse_press(my, content_y, content_h, total, offset, len);
+                                            if delta != 0 { tab.term.scroll_viewport(delta); }
+                                        } else if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) && tab.minimap.dragging {
+                                            let delta = tab.minimap.handle_mouse_drag(my, content_y, content_h, total, offset, len);
+                                            if delta != 0 { tab.term.scroll_viewport(delta); }
+                                        }
+                                    }
+                                    if rl.is_mouse_button_released(MouseButton::MOUSE_BUTTON_LEFT) {
+                                        tab.minimap.handle_mouse_release();
+                                    }
+                                } else {
+                                    // Terminal area: always call handle_mouse for mouse tracking + scroll wheel
+                                    terminal::input::handle_mouse(
+                                        &rl, &mut tab.term, &tab.pty,
+                                        cell_width, cell_height,
+                                        pad, pad + tab_bar_h,
+                                        pad + minimap_width,
+                                        r.w, r.h,
+                                        r.x, r.y,
+                                    );
+                                    if !mouse_tracking {
+                                        let (col, row) = selection::mouse_to_cell(local_mx, local_my - tab_bar_h, cell_width, cell_height, pad, pad);
+                                        if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
+                                            tab.selection.begin(col, row);
+                                        } else if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) && tab.selection.active {
+                                            tab.selection.update(col, row);
+                                        } else if rl.is_mouse_button_released(MouseButton::MOUSE_BUTTON_LEFT) && tab.selection.active {
+                                            tab.selection.update(col, row);
+                                            tab.selection.finish();
+                                        }
+                                    }
                                 }
                             }
-                            if rl.is_mouse_button_released(MouseButton::MOUSE_BUTTON_LEFT) {
-                                tab.minimap.handle_mouse_release();
-                            }
-                        } else if !mouse_tracking {
-                            let (col, row) = selection::mouse_to_cell(mx, my - tab_bar.height, cell_width, cell_height, pad);
-                            if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
-                                tab.selection.begin(col, row);
-                            } else if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) && tab.selection.active {
-                                tab.selection.update(col, row);
-                            } else if rl.is_mouse_button_released(MouseButton::MOUSE_BUTTON_LEFT) && tab.selection.active {
-                                tab.selection.update(col, row);
-                                tab.selection.finish();
-                            }
+                        }
+                    }
+
+                    // Close empty panels from tab bar close button
+                    let empty_panel = root.panel_by_id(focused_panel_id)
+                        .map(|p| p.tabs.is_empty())
+                        .unwrap_or(false);
+                    if empty_panel {
+                        if root.panel_count() <= 1 {
+                            app_exit = true;
+                        } else {
+                            let leaves = root.collect_leaves();
+                            let idx = leaves.iter().position(|&id| id == focused_panel_id).unwrap_or(0);
+                            root.close_panel(focused_panel_id);
+                            let new_leaves = root.collect_leaves();
+                            focused_panel_id = new_leaves[idx.min(new_leaves.len() - 1)];
+                            let scr_w = rl.get_screen_width();
+                            let scr_h = rl.get_screen_height();
+                            relayout_and_resize(&mut root, scr_w, scr_h, status_bar_height, pad, minimap_width, cell_width, cell_height);
+                            last_title.clear();
                         }
                     }
                 }
 
-                // Input handling based on mode (active tab)
-                let tab = &mut tabs[active_tab];
-                let mode = tab.router.mode();
+                // Keyboard input dispatch -- focused panel only
+                if let Some(panel) = root.panel_by_id_mut(focused_panel_id) {
+                    if !panel.tabs.is_empty() {
+                        let tab = &mut panel.tabs[panel.active_tab];
+                        let mode = tab.router.mode();
 
-                if ctrl_held && rl.is_key_pressed(KeyboardKey::KEY_SLASH) {
-                    tab.router.toggle_ai_mode();
-                } else if ctrl_held && rl.is_key_pressed(KeyboardKey::KEY_Y) {
-                    tab.router.toggle_auto_execute();
-                } else {
-                    match mode {
-                        InputMode::Shell => {
-                            if !tab.child_exited {
-                                let chars = terminal::input::handle_input(&rl, &mut tab.term, &tab.pty);
-                                for c in chars {
-                                    tab.router.track_shell_char(c);
-                                }
-                                terminal::input::handle_mouse(&rl, &mut tab.term, &tab.pty, cell_width, cell_height, pad + tab_bar.height);
-                            }
-                        }
-                        InputMode::AiPrompt => {
-                            let ctrl = rl.is_key_down(KeyboardKey::KEY_LEFT_CONTROL)
-                                || rl.is_key_down(KeyboardKey::KEY_RIGHT_CONTROL);
-                            if ctrl && rl.is_key_pressed(KeyboardKey::KEY_J) {
-                                tab.router.handle_ai_prompt_char('\n');
-                            } else {
-                                loop {
-                                    let ch = unsafe { raylib::ffi::GetCharPressed() };
-                                    if ch == 0 { break; }
-                                    if ch == 0x0A { continue; }
-                                    if let Some(c) = char::from_u32(ch as u32) {
-                                        tab.router.handle_ai_prompt_char(c);
+                        if ctrl_held && rl.is_key_pressed(KeyboardKey::KEY_SLASH) {
+                            tab.router.toggle_ai_mode();
+                        } else if ctrl_held && rl.is_key_pressed(KeyboardKey::KEY_Y) {
+                            tab.router.toggle_auto_execute();
+                        } else {
+                            match mode {
+                                InputMode::Shell => {
+                                    if !tab.child_exited {
+                                        let chars = terminal::input::handle_input(&rl, &mut tab.term, &tab.pty);
+                                        for c in chars {
+                                            tab.router.track_shell_char(c);
+                                        }
                                     }
                                 }
-                            }
-                            if rl.is_key_pressed(KeyboardKey::KEY_BACKSPACE)
-                                || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_BACKSPACE as i32) }
-                            {
-                                tab.router.handle_ai_prompt_backspace();
-                            }
-                            if rl.is_key_pressed(KeyboardKey::KEY_UP)
-                                || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_UP as i32) }
-                            {
-                                tab.router.handle_ai_prompt_history_up();
-                            }
-                            if rl.is_key_pressed(KeyboardKey::KEY_DOWN)
-                                || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_DOWN as i32) }
-                            {
-                                tab.router.handle_ai_prompt_history_down();
-                            }
-                            if rl.is_key_pressed(KeyboardKey::KEY_ENTER) && !ctrl {
-                                tab.router.handle_ai_prompt_submit(&mut tab.term, &tab.pty);
-                            }
-                            if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
-                                tab.router.handle_ai_prompt_cancel();
-                            }
-                        }
-                        InputMode::AiStreaming => {
-                            if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
-                                // TODO: cancel
-                            }
-                        }
-                        InputMode::CommandConfirm => {
-                            if rl.is_key_pressed(KeyboardKey::KEY_ENTER) {
-                                tab.router.handle_command_confirm_enter(&mut tab.term, &tab.pty, &mut tab.overlay);
-                            } else if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
-                                tab.router.handle_command_confirm_cancel(&tab.pty, &mut tab.overlay);
-                            } else if rl.is_key_pressed(KeyboardKey::KEY_E) {
-                                tab.router.handle_command_confirm_edit(&tab.pty, &mut tab.overlay);
+                                InputMode::AiPrompt => {
+                                    let ctrl = rl.is_key_down(KeyboardKey::KEY_LEFT_CONTROL)
+                                        || rl.is_key_down(KeyboardKey::KEY_RIGHT_CONTROL);
+                                    if ctrl && rl.is_key_pressed(KeyboardKey::KEY_J) {
+                                        tab.router.handle_ai_prompt_char('\n');
+                                    } else {
+                                        loop {
+                                            let ch = unsafe { raylib::ffi::GetCharPressed() };
+                                            if ch == 0 { break; }
+                                            if ch == 0x0A { continue; }
+                                            if let Some(c) = char::from_u32(ch as u32) {
+                                                tab.router.handle_ai_prompt_char(c);
+                                            }
+                                        }
+                                    }
+                                    if rl.is_key_pressed(KeyboardKey::KEY_BACKSPACE)
+                                        || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_BACKSPACE as i32) }
+                                    {
+                                        tab.router.handle_ai_prompt_backspace();
+                                    }
+                                    if rl.is_key_pressed(KeyboardKey::KEY_UP)
+                                        || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_UP as i32) }
+                                    {
+                                        tab.router.handle_ai_prompt_history_up();
+                                    }
+                                    if rl.is_key_pressed(KeyboardKey::KEY_DOWN)
+                                        || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_DOWN as i32) }
+                                    {
+                                        tab.router.handle_ai_prompt_history_down();
+                                    }
+                                    if rl.is_key_pressed(KeyboardKey::KEY_ENTER) && !ctrl {
+                                        tab.router.handle_ai_prompt_submit(&mut tab.term, &tab.pty);
+                                    }
+                                    if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
+                                        tab.router.handle_ai_prompt_cancel();
+                                    }
+                                }
+                                InputMode::AiStreaming => {
+                                    if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
+                                        // TODO: cancel
+                                    }
+                                }
+                                InputMode::CommandConfirm => {
+                                    if rl.is_key_pressed(KeyboardKey::KEY_ENTER) {
+                                        tab.router.handle_command_confirm_enter(&mut tab.term, &tab.pty, &mut tab.overlay);
+                                    } else if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
+                                        tab.router.handle_command_confirm_cancel(&tab.pty, &mut tab.overlay);
+                                    } else if rl.is_key_pressed(KeyboardKey::KEY_E) {
+                                        tab.router.handle_command_confirm_edit(&tab.pty, &mut tab.overlay);
+                                    }
+                                }
                             }
                         }
                     }
@@ -502,90 +711,176 @@ fn main() {
             }
         }
 
-        // Collect info before mutable borrow for rendering
-        let tab_titles: Vec<String> = tabs.iter().map(|t| t.title()).collect();
-        let tab_count = tabs.len();
+        if app_exit {
+            break;
+        }
 
-        // Render active tab
-        let tab = &mut tabs[active_tab];
-        tab.term.update_render_state();
+        // Collect focused panel info for status bar and AI prompt
+        let focused_mode;
+        let focused_ai_input;
+        let focused_auto_exec;
+        let focused_cwd;
+        let focused_panel_rect;
+        let panel_count = root.panel_count();
 
-        let bg_color = unsafe {
-            let mut colors: bindings::GhosttyRenderStateColors = std::mem::zeroed();
-            colors.size = std::mem::size_of::<bindings::GhosttyRenderStateColors>();
-            bindings::ghostty_render_state_colors_get(tab.term.render_state(), &mut colors);
-            Color::new(colors.background.r, colors.background.g, colors.background.b, 255)
-        };
+        let panel_info;
+        {
+            let leaves = root.collect_leaves();
+            let panel_idx = leaves.iter().position(|&id| id == focused_panel_id).unwrap_or(0) + 1;
+            if let Some(fp) = root.panel_by_id(focused_panel_id) {
+                let tab = fp.active_tab();
+                focused_mode = tab.router.mode();
+                focused_ai_input = tab.router.ai_input_buffer().to_string();
+                focused_auto_exec = tab.router.auto_execute();
+                focused_cwd = tab.pty.get_cwd()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "~".to_string());
+                focused_panel_rect = fp.rect;
+                panel_info = Some((panel_idx, panel_count, fp.active_tab + 1, fp.tabs.len()));
+            } else {
+                focused_mode = InputMode::Shell;
+                focused_ai_input = String::new();
+                focused_auto_exec = false;
+                focused_cwd = "~".to_string();
+                focused_panel_rect = PanelRect { x: 0, y: 0, w: 0, h: 0 };
+                panel_info = None;
+            }
+        }
 
-        let cwd_str = tab.pty
-            .get_cwd()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "~".to_string());
-
-        let active_mode = tab.router.mode();
-        let ai_input = tab.router.ai_input_buffer().to_string();
-        let auto_exec = tab.router.auto_execute();
-        let child_exited = tab.child_exited;
-
+        // --- RENDERING ---
         let mut d = rl.begin_drawing(&thread);
-        d.clear_background(bg_color);
 
-        // Tab bar
-        tab_bar.render(&tab_titles, active_tab, &mono_font, font_size, d.get_screen_width(), &mut d);
+        // Clear with dark background first
+        d.clear_background(Color::new(20, 20, 25, 255));
 
-        // Terminal grid (offset by tab bar height)
-        terminal::renderer::render_terminal(
-            tab.term.render_state(),
-            tab.term.row_iter(),
-            tab.term.row_cells(),
-            &mono_font,
-            cell_width,
-            cell_height,
-            font_size,
-            pad + tab_bar.height,
-            tab.term.handle(),
-            &mut d,
-        );
+        // Render all panels
+        root.for_each_panel_mut(&mut |panel| {
+            let r = panel.rect;
+            let is_focused = panel.id == focused_panel_id;
 
-        // Minimap
-        if let Some((total, offset, len)) = tab.term.get_scrollbar() {
-            let scr_w = d.get_screen_width();
-            let scr_h = d.get_screen_height();
-            tab.minimap.render(total, offset, len, scr_w, scr_h, status_bar_height + tab_bar.height, pad, &mut d);
-        }
+            let tab_titles: Vec<String> = panel.tabs.iter().map(|t| t.title()).collect();
+            let active_idx = panel.active_tab;
 
-        // Text selection highlight
-        if tab.selection.has_selection() {
-            let scr_w = d.get_screen_width();
-            let term_cols = (scr_w - 2 * pad) / cell_width;
-            let scr_h = d.get_screen_height();
-            let term_rows = ((scr_h - status_bar_height - tab_bar.height) - 2 * pad) / cell_height;
-            tab.selection.render(cell_width, cell_height, pad + tab_bar.height, term_cols, term_rows, &mut d);
-        }
+            if panel.tabs.is_empty() {
+                return;
+            }
 
-        // Floating AI prompt panel
-        if active_mode == InputMode::AiPrompt {
+            let tab = &mut panel.tabs[active_idx];
+            tab.term.update_render_state();
+
+            let bg_color = unsafe {
+                let mut colors: bindings::GhosttyRenderStateColors = std::mem::zeroed();
+                colors.size = std::mem::size_of::<bindings::GhosttyRenderStateColors>();
+                bindings::ghostty_render_state_colors_get(tab.term.render_state(), &mut colors);
+                Color::new(colors.background.r, colors.background.g, colors.background.b, 255)
+            };
+
+            let tab_bar_h = panel.tab_bar.height;
+
+            // Scissor clip to panel bounds
+            unsafe { raylib::ffi::BeginScissorMode(r.x, r.y, r.w, r.h); }
+
+            d.draw_rectangle(r.x, r.y, r.w, r.h, bg_color);
+
+            // Tab bar
+            panel.tab_bar.render(&tab_titles, active_idx, &mono_font, font_size, r.x, r.y, r.w, &mut d);
+
+            // Terminal grid
+            let grid_pad_x = r.x + pad;
+            let grid_pad_y = r.y + tab_bar_h + pad;
+            terminal::renderer::render_terminal(
+                tab.term.render_state(),
+                tab.term.row_iter(),
+                tab.term.row_cells(),
+                &mono_font,
+                cell_width,
+                cell_height,
+                font_size,
+                grid_pad_x,
+                grid_pad_y,
+                tab.term.handle(),
+                &mut d,
+            );
+
+            // Minimap (content area below tab bar)
+            if let Some((total, offset, len)) = tab.term.get_scrollbar() {
+                let content_y = r.y + tab_bar_h;
+                let content_h = r.h - tab_bar_h;
+                tab.minimap.render(total, offset, len, r.x, content_y, r.w, content_h, &mut d);
+            }
+
+            // Selection highlight
+            if tab.selection.has_selection() {
+                let term_cols = (r.w - 2 * pad - minimap_width) / cell_width;
+                let term_rows = ((r.h - tab_bar_h) - 2 * pad) / cell_height;
+                tab.selection.render(cell_width, cell_height, grid_pad_x, grid_pad_y, term_cols, term_rows, &mut d);
+            }
+
+            // Overlay (focused only)
+            if is_focused {
+                tab.overlay.render(&mono_font, r.x, r.y, r.w, r.h, font_size, &mut d);
+            }
+
+            // [process exited] banner
+            if tab.child_exited {
+                let msg = "[process exited]";
+                let msg_c = std::ffi::CString::new(msg).unwrap();
+                let banner_h = font_size + 8;
+                d.draw_rectangle(r.x, r.y + r.h - banner_h, r.w, banner_h, Color::new(0, 0, 0, 180));
+                unsafe {
+                    raylib::ffi::DrawTextEx(
+                        mono_font,
+                        msg_c.as_ptr(),
+                        raylib::ffi::Vector2 {
+                            x: (r.x + 10) as f32,
+                            y: (r.y + r.h - banner_h + 4) as f32,
+                        },
+                        font_size as f32,
+                        0.0,
+                        raylib::ffi::Color { r: 255, g: 255, b: 255, a: 255 },
+                    );
+                }
+            }
+
+            unsafe { raylib::ffi::EndScissorMode(); }
+
+            // Focus border (outside scissor)
+            if is_focused && panel_count > 1 {
+                d.draw_rectangle(r.x, r.y, r.w, 2, Color::new(80, 140, 220, 200));
+                d.draw_rectangle(r.x, r.y + r.h - 2, r.w, 2, Color::new(80, 140, 220, 200));
+                d.draw_rectangle(r.x, r.y, 2, r.h, Color::new(80, 140, 220, 200));
+                d.draw_rectangle(r.x + r.w - 2, r.y, 2, r.h, Color::new(80, 140, 220, 200));
+            }
+        });
+
+        // Separator lines between panels
+        root.draw_separators(&mut d);
+
+        // Floating AI prompt panel (focused panel only)
+        if focused_mode == InputMode::AiPrompt {
+            let pr = focused_panel_rect;
             let screen_w = d.get_screen_width();
             let screen_h = d.get_screen_height();
 
-            let panel_w = (screen_w * 3 / 4).min(700).max(300);
-            let panel_x = (screen_w - panel_w) / 2;
+            let ai_panel_w = (pr.w * 3 / 4).min(700).max(300);
+            let ai_panel_x = pr.x + (pr.w - ai_panel_w) / 2;
             let inner_pad = 12;
             let label_h = cell_height + 4;
 
-            let lines: Vec<&str> = ai_input.split('\n').collect();
+            let lines: Vec<&str> = focused_ai_input.split('\n').collect();
             let line_count = lines.len().max(1) as i32;
             let text_h = line_count * cell_height;
-            let panel_h = label_h + text_h + inner_pad * 2 + 4;
-            let panel_y = screen_h - status_bar_height - panel_h - 8;
+            let ai_panel_h = label_h + text_h + inner_pad * 2 + 4;
+            let ai_panel_y = pr.y + pr.h - ai_panel_h - 8;
 
+            // Dim overlay over full window
             d.draw_rectangle(0, 0, screen_w, screen_h, Color::new(0, 0, 0, 100));
 
-            d.draw_rectangle(panel_x, panel_y, panel_w, panel_h, Color::new(30, 30, 38, 245));
-            d.draw_rectangle(panel_x, panel_y, panel_w, 1, Color::new(70, 80, 110, 200));
-            d.draw_rectangle(panel_x, panel_y + panel_h - 1, panel_w, 1, Color::new(70, 80, 110, 200));
-            d.draw_rectangle(panel_x, panel_y, 1, panel_h, Color::new(70, 80, 110, 200));
-            d.draw_rectangle(panel_x + panel_w - 1, panel_y, 1, panel_h, Color::new(70, 80, 110, 200));
+            d.draw_rectangle(ai_panel_x, ai_panel_y, ai_panel_w, ai_panel_h, Color::new(30, 30, 38, 245));
+            d.draw_rectangle(ai_panel_x, ai_panel_y, ai_panel_w, 1, Color::new(70, 80, 110, 200));
+            d.draw_rectangle(ai_panel_x, ai_panel_y + ai_panel_h - 1, ai_panel_w, 1, Color::new(70, 80, 110, 200));
+            d.draw_rectangle(ai_panel_x, ai_panel_y, 1, ai_panel_h, Color::new(70, 80, 110, 200));
+            d.draw_rectangle(ai_panel_x + ai_panel_w - 1, ai_panel_y, 1, ai_panel_h, Color::new(70, 80, 110, 200));
 
             let label = std::ffi::CString::new("Ask AI").unwrap_or_default();
             unsafe {
@@ -593,8 +888,8 @@ fn main() {
                     mono_font,
                     label.as_ptr(),
                     raylib::ffi::Vector2 {
-                        x: (panel_x + inner_pad) as f32,
-                        y: (panel_y + inner_pad / 2) as f32,
+                        x: (ai_panel_x + inner_pad) as f32,
+                        y: (ai_panel_y + inner_pad / 2) as f32,
                     },
                     (font_size - 2) as f32,
                     0.0,
@@ -603,15 +898,15 @@ fn main() {
             }
 
             d.draw_rectangle(
-                panel_x + inner_pad,
-                panel_y + label_h,
-                panel_w - inner_pad * 2,
+                ai_panel_x + inner_pad,
+                ai_panel_y + label_h,
+                ai_panel_w - inner_pad * 2,
                 1,
                 Color::new(55, 60, 75, 180),
             );
 
-            let text_y = panel_y + label_h + 6;
-            let text_x = panel_x + inner_pad;
+            let text_y = ai_panel_y + label_h + 6;
+            let text_x = ai_panel_x + inner_pad;
 
             let blink_on = (d.get_time() * 2.0) as i32 % 2 == 0;
             for (i, line) in lines.iter().enumerate() {
@@ -634,47 +929,155 @@ fn main() {
             }
         }
 
-        tab.overlay.render(
-            &mono_font,
-            d.get_screen_width(),
-            d.get_screen_height(),
-            font_size,
-            &mut d,
-        );
+        // Help panel overlay
+        if show_help {
+            let screen_w = d.get_screen_width();
+            let screen_h = d.get_screen_height();
 
+            d.draw_rectangle(0, 0, screen_w, screen_h, Color::new(0, 0, 0, 160));
+
+            let help_w = 520.min(screen_w - 40);
+            let help_x = (screen_w - help_w) / 2;
+            let line_h = cell_height + 2;
+            let inner_pad = 16;
+            let section_gap = 6;
+
+            let sections: &[(&str, &[(&str, &str)])] = &[
+                ("General", &[
+                    ("F1", "Toggle this help panel"),
+                    ("Ctrl+/", "Toggle AI prompt"),
+                    ("Ctrl+Y", "Toggle YOLO (auto-execute)"),
+                    ("Cmd+C", "Copy selection"),
+                    ("Cmd+V", "Paste from clipboard"),
+                ]),
+                ("Tabs", &[
+                    ("Cmd+T", "New tab"),
+                    ("Cmd+W", "Close tab"),
+                    ("Cmd+Shift+]", "Next tab"),
+                    ("Cmd+Shift+[", "Previous tab"),
+                    ("Cmd+1..9", "Jump to tab N"),
+                ]),
+                ("Splits", &[
+                    ("Cmd+D", "Split horizontal"),
+                    ("Cmd+Shift+D", "Split vertical"),
+                    ("Cmd+Shift+W", "Close panel"),
+                    ("Cmd+Opt+Right/Down", "Focus next panel"),
+                    ("Cmd+Opt+Left/Up", "Focus previous panel"),
+                ]),
+                ("Font", &[
+                    ("Cmd++", "Increase font size"),
+                    ("Cmd+-", "Decrease font size"),
+                    ("Cmd+0", "Reset font size"),
+                ]),
+                ("AI Prompt", &[
+                    ("Enter", "Submit prompt"),
+                    ("Ctrl+J", "Newline in prompt"),
+                    ("Up/Down", "History navigation"),
+                    ("Esc", "Cancel prompt"),
+                ]),
+                ("Command Confirm", &[
+                    ("Enter", "Run command"),
+                    ("e", "Edit command"),
+                    ("Esc", "Cancel"),
+                ]),
+            ];
+
+            let title_h = cell_height + 8;
+            let mut total_lines = 0;
+            for (_, entries) in sections {
+                total_lines += 1 + entries.len();
+            }
+            total_lines += sections.len().saturating_sub(1);
+
+            let help_h = title_h + inner_pad * 2 + total_lines as i32 * line_h + (sections.len() as i32 - 1) * section_gap;
+            let help_h = help_h.min(screen_h - 40);
+            let help_y = (screen_h - help_h) / 2;
+
+            d.draw_rectangle(help_x, help_y, help_w, help_h, Color::new(25, 25, 32, 250));
+            d.draw_rectangle(help_x, help_y, help_w, 1, Color::new(70, 80, 110, 220));
+            d.draw_rectangle(help_x, help_y + help_h - 1, help_w, 1, Color::new(70, 80, 110, 220));
+            d.draw_rectangle(help_x, help_y, 1, help_h, Color::new(70, 80, 110, 220));
+            d.draw_rectangle(help_x + help_w - 1, help_y, 1, help_h, Color::new(70, 80, 110, 220));
+
+            let title = std::ffi::CString::new("Keyboard Shortcuts").unwrap_or_default();
+            unsafe {
+                raylib::ffi::DrawTextEx(
+                    mono_font, title.as_ptr(),
+                    raylib::ffi::Vector2 { x: (help_x + inner_pad) as f32, y: (help_y + inner_pad / 2 + 2) as f32 },
+                    font_size as f32, 0.0,
+                    raylib::ffi::Color { r: 220, g: 225, b: 240, a: 255 },
+                );
+            }
+
+            d.draw_rectangle(help_x + inner_pad, help_y + title_h, help_w - inner_pad * 2, 1, Color::new(55, 60, 75, 180));
+
+            let label_size = (font_size - 2).max(8);
+            let key_col_w = 200;
+            let mut cy = help_y + title_h + inner_pad;
+
+            for (si, (section_name, entries)) in sections.iter().enumerate() {
+                if si > 0 {
+                    cy += section_gap;
+                }
+
+                let section_c = std::ffi::CString::new(*section_name).unwrap_or_default();
+                unsafe {
+                    raylib::ffi::DrawTextEx(
+                        mono_font, section_c.as_ptr(),
+                        raylib::ffi::Vector2 { x: (help_x + inner_pad) as f32, y: cy as f32 },
+                        label_size as f32, 0.0,
+                        raylib::ffi::Color { r: 80, g: 140, b: 220, a: 255 },
+                    );
+                }
+                cy += line_h;
+
+                for (key, desc) in *entries {
+                    let key_c = std::ffi::CString::new(*key).unwrap_or_default();
+                    let desc_c = std::ffi::CString::new(*desc).unwrap_or_default();
+                    unsafe {
+                        raylib::ffi::DrawTextEx(
+                            mono_font, key_c.as_ptr(),
+                            raylib::ffi::Vector2 { x: (help_x + inner_pad + 10) as f32, y: cy as f32 },
+                            label_size as f32, 0.0,
+                            raylib::ffi::Color { r: 200, g: 200, b: 140, a: 255 },
+                        );
+                        raylib::ffi::DrawTextEx(
+                            mono_font, desc_c.as_ptr(),
+                            raylib::ffi::Vector2 { x: (help_x + inner_pad + key_col_w) as f32, y: cy as f32 },
+                            label_size as f32, 0.0,
+                            raylib::ffi::Color { r: 180, g: 180, b: 190, a: 255 },
+                        );
+                    }
+                    cy += line_h;
+                }
+            }
+
+            let hint = std::ffi::CString::new("Press F1 or Esc to close").unwrap_or_default();
+            unsafe {
+                raylib::ffi::DrawTextEx(
+                    mono_font, hint.as_ptr(),
+                    raylib::ffi::Vector2 {
+                        x: (help_x + inner_pad) as f32,
+                        y: (help_y + help_h - cell_height - inner_pad / 2) as f32,
+                    },
+                    label_size as f32, 0.0,
+                    raylib::ffi::Color { r: 100, g: 100, b: 110, a: 180 },
+                );
+            }
+        }
+
+        // Status bar (global, at bottom)
         status_bar.render(
             &mono_font,
             d.get_screen_width(),
             d.get_screen_height(),
             font_size,
-            active_mode,
-            &cwd_str,
-            &ai_input,
-            auto_exec,
-            if tab_count > 1 { Some((active_tab + 1, tab_count)) } else { None },
+            focused_mode,
+            &focused_cwd,
+            &focused_ai_input,
+            focused_auto_exec,
+            panel_info,
             &mut d,
         );
-
-        if child_exited {
-            let msg = "[process exited]";
-            let msg_c = std::ffi::CString::new(msg).unwrap();
-            let screen_w = d.get_screen_width();
-            let screen_h = d.get_screen_height();
-            let banner_h = font_size + 8;
-            d.draw_rectangle(0, screen_h - banner_h - status_bar_height, screen_w, banner_h, Color::new(0, 0, 0, 180));
-            unsafe {
-                raylib::ffi::DrawTextEx(
-                    mono_font,
-                    msg_c.as_ptr(),
-                    raylib::ffi::Vector2 {
-                        x: 10.0,
-                        y: (screen_h - banner_h - status_bar_height + 4) as f32,
-                    },
-                    font_size as f32,
-                    0.0,
-                    raylib::ffi::Color { r: 255, g: 255, b: 255, a: 255 },
-                );
-            }
-        }
     }
 }

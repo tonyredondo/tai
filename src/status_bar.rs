@@ -24,7 +24,7 @@ impl StatusBar {
         cwd: &str,
         _ai_input: &str,
         auto_execute: bool,
-        tab_info: Option<(usize, usize)>,
+        panel_info: Option<(usize, usize, usize, usize)>,
         d: &mut RaylibDrawHandle,
     ) {
         let bar_h = font_size + 8;
@@ -51,8 +51,16 @@ impl StatusBar {
 
         d.draw_rectangle(0, bar_y, screen_w, bar_h, bg_color);
 
-        let tab_prefix = match tab_info {
-            Some((active, total)) => format!("Tab {}/{} | ", active, total),
+        let tab_prefix = match panel_info {
+            Some((panel_idx, panel_count, tab_idx, tab_count)) => {
+                if panel_count > 1 {
+                    format!("Panel {}/{} | Tab {}/{} | ", panel_idx, panel_count, tab_idx, tab_count)
+                } else if tab_count > 1 {
+                    format!("Tab {}/{} | ", tab_idx, tab_count)
+                } else {
+                    String::new()
+                }
+            }
             None => String::new(),
         };
 
@@ -61,7 +69,7 @@ impl StatusBar {
                 let yolo = if auto_execute { " | YOLO" } else { "" };
                 if self.ai_available {
                     format!(
-                        " {}shell | model: {} | cwd: {} | Ctrl+/ AI | Cmd+T tab{}",
+                        " {}shell | model: {} | cwd: {} | Ctrl+/ AI | F1 help{}",
                         tab_prefix, self.model, cwd, yolo
                     )
                 } else {

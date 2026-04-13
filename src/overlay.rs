@@ -31,16 +31,15 @@ impl CommandOverlay {
         self.visible
     }
 
-    pub fn render(&self, font: &raylib::ffi::Font, screen_w: i32, screen_h: i32, font_size: i32, d: &mut RaylibDrawHandle) {
+    pub fn render(&self, font: &raylib::ffi::Font, panel_x: i32, panel_y: i32, panel_w: i32, panel_h: i32, font_size: i32, d: &mut RaylibDrawHandle) {
         if !self.visible {
             return;
         }
 
-        let status_bar_h = font_size + 8;
         let box_h = font_size * 5;
-        let box_y = screen_h - box_h - status_bar_h - 10;
-        let box_x = 20;
-        let box_w = screen_w - 40;
+        let box_y = panel_y + panel_h - box_h - 10;
+        let box_x = panel_x + 20;
+        let box_w = panel_w - 40;
 
         d.draw_rectangle(box_x - 2, box_y - 2, box_w + 4, box_h + 4, Color::new(80, 60, 10, 200));
         d.draw_rectangle(box_x, box_y, box_w, box_h, Color::new(25, 25, 35, 240));

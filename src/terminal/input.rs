@@ -248,22 +248,33 @@ pub fn handle_input(rl: &RaylibHandle, terminal: &mut Terminal, pty: &Pty) -> Ve
     typed_chars
 }
 
-pub fn handle_mouse(rl: &RaylibHandle, terminal: &mut Terminal, pty: &Pty, cell_width: i32, cell_height: i32, pad: i32) {
+pub fn handle_mouse(
+    rl: &RaylibHandle,
+    terminal: &mut Terminal,
+    pty: &Pty,
+    cell_width: i32,
+    cell_height: i32,
+    pad_x: i32,
+    pad_y: i32,
+    padding_right: i32,
+    panel_w: i32,
+    panel_h: i32,
+    panel_offset_x: i32,
+    panel_offset_y: i32,
+) {
     unsafe {
         ghostty_mouse_encoder_setopt_from_terminal(terminal.mouse_encoder(), terminal.handle());
 
-        let scr_w = rl.get_screen_width();
-        let scr_h = rl.get_screen_height();
         let mut enc_size: GhosttyMouseEncoderSize = std::mem::zeroed();
         enc_size.size = std::mem::size_of::<GhosttyMouseEncoderSize>();
-        enc_size.screen_width = scr_w as u32;
-        enc_size.screen_height = scr_h as u32;
+        enc_size.screen_width = panel_w as u32;
+        enc_size.screen_height = panel_h as u32;
         enc_size.cell_width = cell_width as u32;
         enc_size.cell_height = cell_height as u32;
-        enc_size.padding_top = pad as u32;
-        enc_size.padding_bottom = pad as u32;
-        enc_size.padding_left = pad as u32;
-        enc_size.padding_right = pad as u32;
+        enc_size.padding_top = pad_y as u32;
+        enc_size.padding_bottom = pad_x as u32;
+        enc_size.padding_left = pad_x as u32;
+        enc_size.padding_right = padding_right as u32;
         ghostty_mouse_encoder_setopt(
             terminal.mouse_encoder(),
             GhosttyMouseEncoderOption_GHOSTTY_MOUSE_ENCODER_OPT_SIZE,
@@ -291,7 +302,10 @@ pub fn handle_mouse(rl: &RaylibHandle, terminal: &mut Terminal, pty: &Pty, cell_
         ghostty_mouse_event_set_mods(terminal.mouse_event(), mods);
         ghostty_mouse_event_set_position(
             terminal.mouse_event(),
-            GhosttyMousePosition { x: pos.x, y: pos.y },
+            GhosttyMousePosition {
+                x: pos.x - panel_offset_x as f32,
+                y: pos.y - panel_offset_y as f32,
+            },
         );
 
         let buttons = [

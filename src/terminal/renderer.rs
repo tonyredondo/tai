@@ -53,7 +53,8 @@ pub fn render_terminal(
     cell_width: i32,
     cell_height: i32,
     font_size: i32,
-    pad: i32,
+    pad_x: i32,
+    pad_y: i32,
     _terminal: GhosttyTerminal,
     d: &mut RaylibDrawHandle,
 ) {
@@ -74,7 +75,7 @@ pub fn render_terminal(
             return;
         }
 
-        let mut y = pad;
+        let mut y = pad_y;
 
         while ghostty_render_state_row_iterator_next(row_iter) {
             if ghostty_render_state_row_get(
@@ -87,7 +88,7 @@ pub fn render_terminal(
                 continue;
             }
 
-            let mut x = pad;
+            let mut x = pad_x;
 
             while ghostty_render_state_row_cells_next(row_cells) {
                 let mut grapheme_len: u32 = 0;
@@ -253,8 +254,8 @@ pub fn render_terminal(
             if colors.cursor_has_value {
                 cur_rgb = colors.cursor;
             }
-            let cur_x = pad + cx as i32 * cell_width;
-            let cur_y = pad + cy as i32 * cell_height;
+            let cur_x = pad_x + cx as i32 * cell_width;
+            let cur_y = pad_y + cy as i32 * cell_height;
             d.draw_rectangle(
                 cur_x,
                 cur_y,

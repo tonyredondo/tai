@@ -110,7 +110,7 @@ unsafe extern "C" fn effect_title_changed(
             if !title.ptr.is_null() && title.len > 0 {
                 let slice = std::slice::from_raw_parts(title.ptr, title.len);
                 if let Ok(s) = std::str::from_utf8(slice) {
-                    let prefixed = format!("TAI - {}", s);
+                    let prefixed = format!("Terminal AI - {}", s);
                     let c_str = std::ffi::CString::new(prefixed).unwrap_or_default();
                     raylib::ffi::SetWindowTitle(c_str.as_ptr());
                 }

@@ -153,7 +153,7 @@ fn main() {
 
     let (mut rl, thread) = raylib::init()
         .size(800, 600)
-        .title("TAI - Terminal AI")
+        .title("Terminal AI")
         .resizable()
         .build();
 
@@ -255,8 +255,8 @@ fn main() {
         title_frame += 1;
         if title_frame % 30 == 0 {
             let new_title = match pty.get_foreground_process_name() {
-                Some(name) => format!("TAI - {}", name),
-                None => "TAI - Terminal AI".to_string(),
+                Some(name) => format!("Terminal AI - {}", name),
+                None => "Terminal AI".to_string(),
             };
             if new_title != last_title {
                 let c_title = std::ffi::CString::new(new_title.as_str()).unwrap_or_default();

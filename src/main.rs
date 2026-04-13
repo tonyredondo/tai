@@ -378,6 +378,12 @@ fn main() {
 
     let mut app_exit = false;
     let mut show_help = false;
+    let mut show_session_mgr = false;
+    let mut sm_names: Vec<String> = Vec::new();
+    let mut sm_selected: usize = 0;
+    let mut sm_scroll: usize = 0;
+    let mut sm_input: Option<String> = None;
+    let mut sm_status: Option<(String, Instant)> = None;
     let mut last_autosave = Instant::now();
 
     while !rl.window_should_close() && !app_exit && !SIGNAL_EXIT.load(Ordering::Relaxed) {
@@ -442,21 +448,214 @@ fn main() {
         // Help panel toggle (F1)
         if rl.is_key_pressed(KeyboardKey::KEY_F1) {
             show_help = !show_help;
+            if show_help {
+                show_session_mgr = false;
+            }
         } else if show_help && rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
             show_help = false;
         }
 
         if show_help {
-            // swallow all input while help is visible
             loop {
                 if unsafe { raylib::ffi::GetCharPressed() } == 0 { break; }
             }
         }
 
+        // Session manager toggle (F2)
+        if rl.is_key_pressed(KeyboardKey::KEY_F2) {
+            show_session_mgr = !show_session_mgr;
+            if show_session_mgr {
+                show_help = false;
+                sm_names = session::list_sessions();
+                sm_selected = 0;
+                sm_scroll = 0;
+                sm_input = None;
+                sm_status = None;
+            }
+        }
+
+        // Session manager status message expiry
+        if sm_status.as_ref().map_or(false, |(_, ts)| ts.elapsed().as_secs() >= 3) {
+            sm_status = None;
+        }
+
+        // Session manager input handling
+        if show_session_mgr {
+            const SM_MAX_VISIBLE: usize = 15;
+
+            if let Some(ref mut input) = sm_input {
+                // Name-input mode: read chars into buffer
+                loop {
+                    let ch = unsafe { raylib::ffi::GetCharPressed() };
+                    if ch == 0 { break; }
+                    if let Some(c) = char::from_u32(ch as u32) {
+                        if c as u32 > 31 && c != '/' && c != '\0' && input.len() < 64 {
+                            input.push(c);
+                        }
+                    }
+                }
+                if rl.is_key_pressed(KeyboardKey::KEY_BACKSPACE)
+                    || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_BACKSPACE as i32) }
+                {
+                    input.pop();
+                }
+                if rl.is_key_pressed(KeyboardKey::KEY_ENTER) {
+                    let name = input.clone();
+                    if !name.is_empty() {
+                        let win_pos = unsafe { raylib::ffi::GetWindowPosition() };
+                        match session::save(
+                            &root, focused_panel_id, next_panel_id, font_size,
+                            rl.get_screen_width(), rl.get_screen_height(),
+                            win_pos.x as i32, win_pos.y as i32,
+                        ) {
+                            Ok(()) => {
+                                match session::export_session(&name) {
+                                    Ok(()) => {
+                                        sm_names = session::list_sessions();
+                                        sm_selected = sm_names.iter().position(|n| n == &name).unwrap_or(0);
+                                        if sm_selected >= sm_scroll + SM_MAX_VISIBLE {
+                                            sm_scroll = sm_selected.saturating_sub(SM_MAX_VISIBLE - 1);
+                                        } else if sm_selected < sm_scroll {
+                                            sm_scroll = sm_selected;
+                                        }
+                                        sm_status = Some((format!("Session '{}' exported", name), Instant::now()));
+                                    }
+                                    Err(e) => {
+                                        sm_status = Some((format!("Export failed: {e}"), Instant::now()));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                sm_status = Some((format!("Save failed: {e}"), Instant::now()));
+                            }
+                        }
+                        sm_input = None;
+                    }
+                }
+                if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
+                    sm_input = None;
+                }
+            } else {
+                // List mode: swallow all chars to prevent leaking to terminal
+                loop {
+                    if unsafe { raylib::ffi::GetCharPressed() } == 0 { break; }
+                }
+
+                if rl.is_key_pressed(KeyboardKey::KEY_UP)
+                    || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_UP as i32) }
+                {
+                    sm_selected = sm_selected.saturating_sub(1);
+                    if sm_selected < sm_scroll {
+                        sm_scroll = sm_selected;
+                    }
+                }
+                if rl.is_key_pressed(KeyboardKey::KEY_DOWN)
+                    || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_DOWN as i32) }
+                {
+                    sm_selected = (sm_selected + 1).min(sm_names.len().saturating_sub(1));
+                    if sm_selected >= sm_scroll + SM_MAX_VISIBLE {
+                        sm_scroll = sm_selected.saturating_sub(SM_MAX_VISIBLE - 1);
+                    }
+                }
+                if rl.is_key_pressed(KeyboardKey::KEY_S) {
+                    sm_input = Some(String::new());
+                }
+                if rl.is_key_pressed(KeyboardKey::KEY_D) && !sm_names.is_empty() {
+                    let name = sm_names[sm_selected].clone();
+                    match session::delete_named_session(&name) {
+                        Ok(()) => {
+                            sm_status = Some((format!("Session '{}' deleted", name), Instant::now()));
+                        }
+                        Err(e) => {
+                            sm_status = Some((format!("{e}"), Instant::now()));
+                        }
+                    }
+                    sm_names = session::list_sessions();
+                    sm_selected = sm_selected.min(sm_names.len().saturating_sub(1));
+                    if sm_selected < sm_scroll {
+                        sm_scroll = sm_selected;
+                    }
+                    if !sm_names.is_empty() && sm_scroll > sm_names.len().saturating_sub(SM_MAX_VISIBLE) {
+                        sm_scroll = sm_names.len().saturating_sub(SM_MAX_VISIBLE);
+                    }
+                }
+                if rl.is_key_pressed(KeyboardKey::KEY_ENTER) && !sm_names.is_empty() {
+                    // Load selected session (in-app)
+                    let win_pos = unsafe { raylib::ffi::GetWindowPosition() };
+                    let _ = session::save(
+                        &root, focused_panel_id, next_panel_id, font_size,
+                        rl.get_screen_width(), rl.get_screen_height(),
+                        win_pos.x as i32, win_pos.y as i32,
+                    );
+
+                    let name = sm_names[sm_selected].clone();
+                    match session::import_session(&name) {
+                        Ok(Some(state)) => {
+                            let new_font_size = state.font_size;
+                            let font_changed = new_font_size != font_size;
+                            let old_font_size = font_size;
+                            let old_mono_font = mono_font;
+                            let old_cell_width = cell_width;
+                            let old_cell_height = cell_height;
+                            let old_status_bar_height = status_bar_height;
+
+                            if font_changed {
+                                font_size = new_font_size;
+                                metrics = load_font(font_size, dpi_scale, &mut codepoints);
+                                mono_font = metrics.font;
+                                cell_width = metrics.cell_width;
+                                cell_height = metrics.cell_height;
+                                status_bar_height = font_size + 8;
+                            }
+
+                            let scr_w = rl.get_screen_width();
+                            let scr_h = rl.get_screen_height();
+                            match session::restore(
+                                state, &config, scr_w, scr_h,
+                                status_bar_height, pad, minimap_width, cell_width, cell_height,
+                            ) {
+                                Ok((new_root, focused, next_id, _)) => {
+                                    if font_changed {
+                                        unsafe { raylib::ffi::UnloadFont(old_mono_font); }
+                                    }
+                                    root = new_root;
+                                    focused_panel_id = focused;
+                                    next_panel_id = next_id;
+                                    last_autosave = Instant::now();
+                                    last_title.clear();
+                                    show_session_mgr = false;
+                                }
+                                Err(e) => {
+                                    if font_changed {
+                                        unsafe { raylib::ffi::UnloadFont(mono_font); }
+                                        mono_font = old_mono_font;
+                                        font_size = old_font_size;
+                                        cell_width = old_cell_width;
+                                        cell_height = old_cell_height;
+                                        status_bar_height = old_status_bar_height;
+                                    }
+                                    sm_status = Some((format!("Restore failed: {e}"), Instant::now()));
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            sm_status = Some(("Session corrupted or incompatible".into(), Instant::now()));
+                        }
+                        Err(e) => {
+                            sm_status = Some((format!("Import failed: {e}"), Instant::now()));
+                        }
+                    }
+                }
+                if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
+                    show_session_mgr = false;
+                }
+            }
+        }
+
         // Split keybindings (Cmd+D, Cmd+Shift+D, Cmd+Shift+W, Cmd+Option+Arrows)
         let mut did_split_action = false;
-        if show_help {
-            // all input blocked while help is open
+        if show_help || show_session_mgr {
+            // all input blocked while overlay is open
         } else if cmd_held && !shift_held && rl.is_key_pressed(KeyboardKey::KEY_D) {
             let new_id = alloc_panel_id(&mut next_panel_id);
             if let Some(fp) = root.panel_by_id(focused_panel_id) {
@@ -532,7 +731,9 @@ fn main() {
             did_split_action = true;
         }
 
-        if did_split_action {
+        if show_session_mgr {
+            // input handled by session manager above
+        } else if did_split_action {
             // skip other keybindings this frame
         } else {
             // Tab management keybindings (scoped to focused panel)
@@ -1107,6 +1308,7 @@ fn main() {
             let sections: &[(&str, &[(&str, &str)])] = &[
                 ("General", &[
                     ("F1", "Toggle this help panel"),
+                    ("F2", "Session manager"),
                     ("Ctrl+/", "Toggle AI prompt"),
                     ("Ctrl+Y", "Toggle YOLO (auto-execute)"),
                     ("Cmd+C", "Copy selection"),
@@ -1228,6 +1430,162 @@ fn main() {
                         x: (help_x + inner_pad) as f32,
                         y: (help_y + help_h - cell_height - inner_pad / 2) as f32,
                     },
+                    label_size as f32, 0.0,
+                    raylib::ffi::Color { r: 100, g: 100, b: 110, a: 180 },
+                );
+            }
+        }
+
+        // Session manager overlay
+        if show_session_mgr {
+            const SM_MAX_VISIBLE: usize = 15;
+
+            let screen_w = d.get_screen_width();
+            let screen_h = d.get_screen_height();
+
+            d.draw_rectangle(0, 0, screen_w, screen_h, Color::new(0, 0, 0, 160));
+
+            let inner_pad = 16;
+            let line_h = cell_height + 4;
+            let label_size = (font_size - 2).max(8);
+            let title_h = cell_height + 8;
+            let visible_count = sm_names.len().min(SM_MAX_VISIBLE).max(1);
+            let list_h = visible_count as i32 * line_h;
+            let footer_h = line_h + 4;
+            let status_h = if sm_status.is_some() { line_h } else { 0 };
+            let input_h = if sm_input.is_some() { line_h + 4 } else { 0 };
+
+            let sm_w = 480.min(screen_w - 40);
+            let sm_h = title_h + inner_pad * 2 + list_h + footer_h + status_h + input_h;
+            let sm_h = sm_h.min(screen_h - 40);
+            let sm_x = (screen_w - sm_w) / 2;
+            let sm_y = (screen_h - sm_h) / 2;
+
+            d.draw_rectangle(sm_x, sm_y, sm_w, sm_h, Color::new(25, 25, 32, 250));
+            d.draw_rectangle(sm_x, sm_y, sm_w, 1, Color::new(70, 80, 110, 220));
+            d.draw_rectangle(sm_x, sm_y + sm_h - 1, sm_w, 1, Color::new(70, 80, 110, 220));
+            d.draw_rectangle(sm_x, sm_y, 1, sm_h, Color::new(70, 80, 110, 220));
+            d.draw_rectangle(sm_x + sm_w - 1, sm_y, 1, sm_h, Color::new(70, 80, 110, 220));
+
+            let title_text = std::ffi::CString::new("Session Manager").unwrap_or_default();
+            unsafe {
+                raylib::ffi::DrawTextEx(
+                    mono_font, title_text.as_ptr(),
+                    raylib::ffi::Vector2 { x: (sm_x + inner_pad) as f32, y: (sm_y + inner_pad / 2 + 2) as f32 },
+                    font_size as f32, 0.0,
+                    raylib::ffi::Color { r: 220, g: 225, b: 240, a: 255 },
+                );
+            }
+            d.draw_rectangle(sm_x + inner_pad, sm_y + title_h, sm_w - inner_pad * 2, 1, Color::new(55, 60, 75, 180));
+
+            let list_y = sm_y + title_h + inner_pad;
+
+            if sm_names.is_empty() {
+                let empty_msg = std::ffi::CString::new("No saved sessions").unwrap_or_default();
+                unsafe {
+                    raylib::ffi::DrawTextEx(
+                        mono_font, empty_msg.as_ptr(),
+                        raylib::ffi::Vector2 { x: (sm_x + inner_pad + 10) as f32, y: list_y as f32 },
+                        label_size as f32, 0.0,
+                        raylib::ffi::Color { r: 120, g: 120, b: 130, a: 180 },
+                    );
+                }
+            } else {
+                let end = (sm_scroll + SM_MAX_VISIBLE).min(sm_names.len());
+                for (i, name) in sm_names[sm_scroll..end].iter().enumerate() {
+                    let abs_idx = sm_scroll + i;
+                    let iy = list_y + i as i32 * line_h;
+
+                    if abs_idx == sm_selected {
+                        d.draw_rectangle(sm_x + inner_pad - 2, iy - 1, sm_w - inner_pad * 2 + 4, line_h, Color::new(50, 60, 90, 200));
+                    }
+
+                    let name_c = std::ffi::CString::new(name.as_str()).unwrap_or_default();
+                    let text_color = if abs_idx == sm_selected {
+                        raylib::ffi::Color { r: 255, g: 255, b: 255, a: 255 }
+                    } else {
+                        raylib::ffi::Color { r: 180, g: 180, b: 190, a: 255 }
+                    };
+                    unsafe {
+                        raylib::ffi::DrawTextEx(
+                            mono_font, name_c.as_ptr(),
+                            raylib::ffi::Vector2 { x: (sm_x + inner_pad + 10) as f32, y: iy as f32 },
+                            label_size as f32, 0.0,
+                            text_color,
+                        );
+                    }
+                }
+
+                if sm_scroll > 0 {
+                    let arrow = std::ffi::CString::new("▲").unwrap_or_default();
+                    unsafe {
+                        raylib::ffi::DrawTextEx(
+                            mono_font, arrow.as_ptr(),
+                            raylib::ffi::Vector2 { x: (sm_x + sm_w - inner_pad - 16) as f32, y: list_y as f32 },
+                            label_size as f32, 0.0,
+                            raylib::ffi::Color { r: 150, g: 150, b: 160, a: 200 },
+                        );
+                    }
+                }
+                if end < sm_names.len() {
+                    let arrow = std::ffi::CString::new("▼").unwrap_or_default();
+                    unsafe {
+                        raylib::ffi::DrawTextEx(
+                            mono_font, arrow.as_ptr(),
+                            raylib::ffi::Vector2 {
+                                x: (sm_x + sm_w - inner_pad - 16) as f32,
+                                y: (list_y + (visible_count as i32 - 1) * line_h) as f32,
+                            },
+                            label_size as f32, 0.0,
+                            raylib::ffi::Color { r: 150, g: 150, b: 160, a: 200 },
+                        );
+                    }
+                }
+            }
+
+            let mut bottom_y = list_y + list_h;
+
+            if let Some((ref msg, _)) = sm_status {
+                let msg_c = std::ffi::CString::new(msg.as_str()).unwrap_or_default();
+                unsafe {
+                    raylib::ffi::DrawTextEx(
+                        mono_font, msg_c.as_ptr(),
+                        raylib::ffi::Vector2 { x: (sm_x + inner_pad + 10) as f32, y: bottom_y as f32 },
+                        label_size as f32, 0.0,
+                        raylib::ffi::Color { r: 240, g: 220, b: 100, a: 255 },
+                    );
+                }
+                bottom_y += line_h;
+            }
+
+            if let Some(ref input) = sm_input {
+                let blink_on = (d.get_time() * 2.0) as i32 % 2 == 0;
+                let cursor = if blink_on { "_" } else { " " };
+                let display = format!("Save as: {}{}", input, cursor);
+                let input_c = std::ffi::CString::new(display.as_str()).unwrap_or_default();
+                unsafe {
+                    raylib::ffi::DrawTextEx(
+                        mono_font, input_c.as_ptr(),
+                        raylib::ffi::Vector2 { x: (sm_x + inner_pad + 10) as f32, y: (bottom_y + 2) as f32 },
+                        label_size as f32, 0.0,
+                        raylib::ffi::Color { r: 220, g: 225, b: 240, a: 255 },
+                    );
+                }
+                bottom_y += line_h + 4;
+            }
+
+            d.draw_rectangle(sm_x + inner_pad, bottom_y, sm_w - inner_pad * 2, 1, Color::new(55, 60, 75, 180));
+
+            let footer_text = if sm_input.is_some() {
+                "[Enter] Confirm  [Esc] Cancel"
+            } else {
+                "[s] Save  [Enter] Load  [d] Delete  [Esc] Close"
+            };
+            let footer_c = std::ffi::CString::new(footer_text).unwrap_or_default();
+            unsafe {
+                raylib::ffi::DrawTextEx(
+                    mono_font, footer_c.as_ptr(),
+                    raylib::ffi::Vector2 { x: (sm_x + inner_pad) as f32, y: (bottom_y + 4) as f32 },
                     label_size as f32, 0.0,
                     raylib::ffi::Color { r: 100, g: 100, b: 110, a: 180 },
                 );

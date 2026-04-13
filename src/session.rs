@@ -624,6 +624,16 @@ pub fn reset_session() -> Result<(), String> {
     Ok(())
 }
 
+pub fn delete_named_session(name: &str) -> Result<(), String> {
+    let dir = sessions_dir().ok_or("no config dir")?;
+    let path = dir.join(format!("{name}.json"));
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("Delete failed: {e}"))
+    } else {
+        Err(format!("Session '{name}' not found"))
+    }
+}
+
 pub fn list_sessions() -> Vec<String> {
     let dir = match sessions_dir() {
         Some(d) => d,

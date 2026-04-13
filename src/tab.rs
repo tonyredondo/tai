@@ -4,8 +4,10 @@ use crate::minimap::Minimap;
 use crate::overlay::CommandOverlay;
 use crate::router::InputRouter;
 use crate::selection::TextSelection;
+use crate::session::{SessionRouter, session_messages_to_api};
 use crate::terminal::engine::{PtyReadResult, Terminal};
 use crate::terminal::pty::Pty;
+use std::path::PathBuf;
 
 pub struct TabSession {
     pub term: Terminal,
@@ -37,6 +39,133 @@ impl TabSession {
             overlay: CommandOverlay::new(),
             pty_mirror: Vec::with_capacity(8192),
             child_exited: false,
+        })
+    }
+
+    pub fn new_in_dir(
+        config: &TaiConfig,
+        cwd: PathBuf,
+        cols: u16,
+        rows: u16,
+        cw: i32,
+        ch: i32,
+        scrollback: &str,
+        scroll_offset: u64,
+        router_state: &SessionRouter,
+    ) -> Result<Self, String> {
+        let mut term = Terminal::new(cols, rows, config.terminal.scrollback)?;
+        let pty = Pty::spawn_in_dir(cwd, cols, rows, cw, ch)?;
+        term.resize(cols, rows, cw as u32, ch as u32);
+
+        // Feed scrollback BEFORE setup_effects so pty_fd is not yet wired
+        if !scrollback.is_empty() {
+            for line in scrollback.lines() {
+                let mut buf = line.as_bytes().to_vec();
+                buf.extend_from_slice(b"\r\n");
+                term.vt_write(&buf);
+            }
+            term.drain_vt_mirror();
+        }
+
+        term.setup_effects(pty.master_fd(), cw, ch);
+
+        // Restore scroll position
+        if let Some((total, _offset, len)) = term.get_scrollbar() {
+            let current_bottom = total.saturating_sub(len) as i64;
+            let delta = scroll_offset as i64 - current_bottom;
+            if delta != 0 {
+                term.scroll_viewport(delta as i32);
+            }
+        }
+
+        let ai_bridge = config.api_key().map(|key| AiBridge::new(&config.ai, &key));
+        let mut router = InputRouter::new(config, ai_bridge);
+        let messages = session_messages_to_api(&router_state.conversation);
+        router.restore_history(
+            router_state.unified_history.clone(),
+            router_state.command_history.clone(),
+            router_state.auto_execute,
+        );
+        router.restore_conversation(messages);
+
+        let mut minimap = Minimap::new(cols);
+        let buffer_text = term.get_buffer_text(0);
+        minimap.rebuild_from_text(&buffer_text);
+
+        Ok(TabSession {
+            term,
+            pty,
+            minimap,
+            router,
+            selection: TextSelection::new(),
+            overlay: CommandOverlay::new(),
+            pty_mirror: Vec::with_capacity(8192),
+            child_exited: false,
+        })
+    }
+
+    pub fn new_dead(
+        config: &TaiConfig,
+        title: &str,
+        scrollback: &str,
+        scroll_offset: u64,
+        cols: u16,
+        rows: u16,
+        cw: i32,
+        ch: i32,
+        router_state: &SessionRouter,
+    ) -> Result<Self, String> {
+        let mut term = Terminal::new(cols, rows, config.terminal.scrollback)?;
+        let pty = Pty::null();
+        term.resize(cols, rows, cw as u32, ch as u32);
+
+        // Feed scrollback with null pty (safe, setup_effects not called yet)
+        if !scrollback.is_empty() {
+            for line in scrollback.lines() {
+                let mut buf = line.as_bytes().to_vec();
+                buf.extend_from_slice(b"\r\n");
+                term.vt_write(&buf);
+            }
+            term.drain_vt_mirror();
+        }
+
+        // Wire effects with -1 fd (harmless)
+        term.setup_effects(pty.master_fd(), cw, ch);
+
+        // Restore scroll position
+        if let Some((total, _offset, len)) = term.get_scrollbar() {
+            let current_bottom = total.saturating_sub(len) as i64;
+            let delta = scroll_offset as i64 - current_bottom;
+            if delta != 0 {
+                term.scroll_viewport(delta as i32);
+            }
+        }
+
+        term.last_osc_title = title.to_string();
+
+        let ai_bridge = config.api_key().map(|key| AiBridge::new(&config.ai, &key));
+        let mut router = InputRouter::new(config, ai_bridge);
+        let messages = session_messages_to_api(&router_state.conversation);
+        router.restore_history(
+            router_state.unified_history.clone(),
+            router_state.command_history.clone(),
+            router_state.auto_execute,
+        );
+        router.restore_conversation(messages);
+
+        let mut minimap = Minimap::new(cols);
+        let buffer_text = term.get_buffer_text(0);
+        minimap.rebuild_from_text(&buffer_text);
+
+        Ok(TabSession {
+            term,
+            pty,
+            minimap,
+            router,
+            selection: TextSelection::new(),
+            overlay: CommandOverlay::new(),
+            pty_mirror: Vec::with_capacity(8192),
+            child_exited: true,
         })
     }
 

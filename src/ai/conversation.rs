@@ -106,6 +106,17 @@ impl ConversationHistory {
         self.messages.clear();
     }
 
+    pub fn messages(&self) -> &VecDeque<ChatCompletionRequestMessage> {
+        &self.messages
+    }
+
+    pub fn push_restored(&mut self, messages: Vec<ChatCompletionRequestMessage>) {
+        for msg in messages {
+            self.messages.push_back(msg);
+        }
+        self.trim();
+    }
+
     pub fn remove_trailing_orphans(&mut self) {
         loop {
             match self.messages.back() {

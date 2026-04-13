@@ -26,7 +26,22 @@ pub fn pty_write_raw(fd: i32, data: &[u8]) {
 }
 
 impl Pty {
+    pub fn null() -> Self {
+        Pty {
+            master_fd: -1,
+            child_pid: Pid::from_raw(0),
+        }
+    }
+
     pub fn spawn(cols: u16, rows: u16, cw: i32, ch: i32) -> Result<Self, String> {
+        Self::spawn_inner(None, cols, rows, cw, ch)
+    }
+
+    pub fn spawn_in_dir(cwd: PathBuf, cols: u16, rows: u16, cw: i32, ch: i32) -> Result<Self, String> {
+        Self::spawn_inner(Some(cwd), cols, rows, cw, ch)
+    }
+
+    fn spawn_inner(cwd: Option<PathBuf>, cols: u16, rows: u16, cw: i32, ch: i32) -> Result<Self, String> {
         unsafe {
             let ws = libc::winsize {
                 ws_row: rows,
@@ -48,6 +63,16 @@ impl Pty {
             }
 
             if pid == 0 {
+                if let Some(ref dir) = cwd {
+                    let c_path = std::ffi::CString::new(dir.to_string_lossy().as_ref())
+                        .unwrap_or_else(|_| std::ffi::CString::new("/").unwrap());
+                    if libc::chdir(c_path.as_ptr()) != 0 {
+                        let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+                        let c_home = std::ffi::CString::new(home.as_str()).unwrap();
+                        libc::chdir(c_home.as_ptr());
+                    }
+                }
+
                 let shell = std::env::var("SHELL").unwrap_or_else(|_| {
                     let pw = libc::getpwuid(libc::getuid());
                     if !pw.is_null() && !(*pw).pw_shell.is_null() {
@@ -222,10 +247,12 @@ impl Pty {
 
 impl Drop for Pty {
     fn drop(&mut self) {
-        unsafe {
-            libc::close(self.master_fd);
-            libc::kill(self.child_pid.as_raw(), libc::SIGHUP);
-            libc::waitpid(self.child_pid.as_raw(), std::ptr::null_mut(), libc::WNOHANG);
+        if self.master_fd >= 0 {
+            unsafe {
+                libc::close(self.master_fd);
+                libc::kill(self.child_pid.as_raw(), libc::SIGHUP);
+                libc::waitpid(self.child_pid.as_raw(), std::ptr::null_mut(), libc::WNOHANG);
+            }
         }
     }
 }

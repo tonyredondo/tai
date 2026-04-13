@@ -366,10 +366,18 @@ impl Terminal {
     }
 
     pub fn get_buffer_text(&self, _lines: usize) -> String {
+        self.get_buffer_formatted(GhosttyFormatterFormat_GHOSTTY_FORMATTER_FORMAT_PLAIN)
+    }
+
+    pub fn get_buffer_vt(&self) -> String {
+        self.get_buffer_formatted(GhosttyFormatterFormat_GHOSTTY_FORMATTER_FORMAT_VT)
+    }
+
+    fn get_buffer_formatted(&self, format: GhosttyFormatterFormat) -> String {
         unsafe {
             let mut opts: GhosttyFormatterTerminalOptions = std::mem::zeroed();
             opts.size = std::mem::size_of::<GhosttyFormatterTerminalOptions>();
-            opts.emit = GhosttyFormatterFormat_GHOSTTY_FORMATTER_FORMAT_PLAIN;
+            opts.emit = format;
             opts.trim = true;
 
             let mut formatter: GhosttyFormatter = ptr::null_mut();

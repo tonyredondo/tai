@@ -10,6 +10,7 @@ mod minimap;
 mod overlay;
 mod router;
 mod selection;
+mod session;
 mod split;
 mod status_bar;
 mod tab;
@@ -24,6 +25,10 @@ use status_bar::StatusBar;
 use tab::TabSession;
 use tab_bar::TabBarAction;
 use raylib::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
+static SIGNAL_EXIT: AtomicBool = AtomicBool::new(false);
 
 const FONT_DATA: &[u8] = include_bytes!("../fonts/JetBrainsMono-Regular.ttf");
 
@@ -159,10 +164,149 @@ fn relayout_and_resize(
     });
 }
 
+fn create_fresh_panel(
+    config: &TaiConfig,
+    scr_w: i32,
+    scr_h: i32,
+    status_bar_height: i32,
+    pad: i32,
+    minimap_width: i32,
+    cell_width: i32,
+    cell_height: i32,
+) -> (SplitNode, u32, u32) {
+    let mut next_panel_id: u32 = 0;
+    let initial_id = alloc_panel_id(&mut next_panel_id);
+    let initial_rect = PanelRect { x: 0, y: 0, w: scr_w, h: scr_h - status_bar_height };
+    let tab_bar_height = cell_height + 14;
+    let (term_cols, term_rows) = panel_term_size(&initial_rect, pad, minimap_width, tab_bar_height, cell_width, cell_height);
+
+    match create_panel(initial_id, config, term_cols, term_rows, cell_width, cell_height) {
+        Ok(panel) => {
+            let mut node = SplitNode::Leaf(panel);
+            node.layout(initial_rect);
+            (node, initial_id, next_panel_id)
+        }
+        Err(e) => {
+            eprintln!("Failed to create initial panel: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+extern "C" fn signal_handler(_sig: nix::libc::c_int) {
+    SIGNAL_EXIT.store(true, Ordering::SeqCst);
+}
+
 fn main() {
+    unsafe {
+        nix::libc::signal(nix::libc::SIGTERM, signal_handler as nix::libc::sighandler_t);
+        nix::libc::signal(nix::libc::SIGINT, signal_handler as nix::libc::sighandler_t);
+    }
+
     let config = TaiConfig::load();
     let default_font_size = config.terminal.font_size;
-    let mut font_size = default_font_size;
+
+    // --- CLI flags (BEFORE raylib init, headless operations exit early) ---
+    let args: Vec<String> = std::env::args().collect();
+    let mut cli_export: Option<String> = None;
+    let mut cli_import: Option<String> = None;
+    let mut cli_reset = false;
+    let mut cli_list = false;
+
+    {
+        let mut i = 1;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--export" => {
+                    if let Some(name) = args.get(i + 1).cloned() {
+                        cli_export = Some(name);
+                    } else {
+                        eprintln!("Error: --export requires a session name.");
+                        return;
+                    }
+                    i += 2;
+                }
+                "--import" => {
+                    if let Some(name) = args.get(i + 1).cloned() {
+                        cli_import = Some(name);
+                    } else {
+                        eprintln!("Error: --import requires a session name.");
+                        return;
+                    }
+                    i += 2;
+                }
+                "--reset" => {
+                    cli_reset = true;
+                    i += 1;
+                }
+                "--list-sessions" => {
+                    cli_list = true;
+                    i += 1;
+                }
+                _ => { i += 1; }
+            }
+        }
+    }
+
+    if cli_list {
+        let names = session::list_sessions();
+        if names.is_empty() {
+            println!("No saved sessions.");
+        } else {
+            for name in &names {
+                println!("{name}");
+            }
+        }
+        return;
+    }
+
+    if let Some(name) = cli_export {
+        match session::export_session(&name) {
+            Ok(()) => println!("Session exported as '{name}'."),
+            Err(e) => eprintln!("Export failed: {e}"),
+        }
+        return;
+    }
+
+    if cli_reset {
+        if let Err(e) = session::reset_session() {
+            eprintln!("Reset failed: {e}");
+        }
+    }
+
+    // --- Load session state (for font size and later restore) ---
+    let loaded_session = if cli_reset {
+        None
+    } else if let Some(ref name) = cli_import {
+        match session::import_session(name) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Import failed: {e}");
+                None
+            }
+        }
+    } else {
+        match session::load() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[TAI] Failed to load session: {e}");
+                None
+            }
+        }
+    };
+
+    let mut font_size = loaded_session
+        .as_ref()
+        .map(|s| s.font_size)
+        .unwrap_or(default_font_size);
+
+    let (saved_win_w, saved_win_h, saved_win_x, saved_win_y) = loaded_session
+        .as_ref()
+        .map(|s| (s.window_width, s.window_height, s.window_x, s.window_y))
+        .unwrap_or((0, 0, 0, 0));
+
+    let init_w = if saved_win_w > 0 { saved_win_w } else { 800 };
+    let init_h = if saved_win_h > 0 { saved_win_h } else { 600 };
 
     unsafe {
         raylib::ffi::SetConfigFlags(
@@ -171,10 +315,14 @@ fn main() {
     }
 
     let (mut rl, thread) = raylib::init()
-        .size(800, 600)
+        .size(init_w, init_h)
         .title("Terminal AI")
         .resizable()
         .build();
+
+    if saved_win_w > 0 && saved_win_h > 0 {
+        unsafe { raylib::ffi::SetWindowPosition(saved_win_x, saved_win_y); }
+    }
 
     rl.set_target_fps(60);
 
@@ -199,25 +347,27 @@ fn main() {
     let ai_available = config.api_key().is_some();
     let status_bar = StatusBar::new(&config.ai.model, ai_available);
 
-    let mut next_panel_id: u32 = 0;
-    let initial_id = alloc_panel_id(&mut next_panel_id);
-
-    let initial_rect = PanelRect { x: 0, y: 0, w: scr_w, h: scr_h - status_bar_height };
-    let tab_bar_height = cell_height + 14;
-    let (term_cols, term_rows) = panel_term_size(&initial_rect, pad, minimap_width, tab_bar_height, cell_width, cell_height);
-
-    let mut root = match create_panel(initial_id, &config, term_cols, term_rows, cell_width, cell_height) {
-        Ok(panel) => {
-            let mut node = SplitNode::Leaf(panel);
-            node.layout(initial_rect);
-            node
+    // --- Restore session or create fresh ---
+    let (mut root, mut focused_panel_id, mut next_panel_id) = if let Some(state) = loaded_session {
+        match session::restore(
+            state,
+            &config,
+            scr_w, scr_h,
+            status_bar_height,
+            pad, minimap_width,
+            cell_width, cell_height,
+        ) {
+            Ok((tree, focused, next_id, _restored_font_size)) => {
+                (tree, focused, next_id)
+            }
+            Err(e) => {
+                eprintln!("[TAI] Session restore failed, starting fresh: {e}");
+                create_fresh_panel(&config, scr_w, scr_h, status_bar_height, pad, minimap_width, cell_width, cell_height)
+            }
         }
-        Err(e) => {
-            eprintln!("Failed to create initial panel: {e}");
-            return;
-        }
+    } else {
+        create_fresh_panel(&config, scr_w, scr_h, status_bar_height, pad, minimap_width, cell_width, cell_height)
     };
-    let mut focused_panel_id: u32 = initial_id;
 
     let mut prev_width = scr_w;
     let mut prev_height = scr_h;
@@ -228,8 +378,20 @@ fn main() {
 
     let mut app_exit = false;
     let mut show_help = false;
+    let mut last_autosave = Instant::now();
 
-    while !rl.window_should_close() && !app_exit {
+    while !rl.window_should_close() && !app_exit && !SIGNAL_EXIT.load(Ordering::Relaxed) {
+        if last_autosave.elapsed().as_secs() >= 5 {
+            let win_pos = unsafe { raylib::ffi::GetWindowPosition() };
+            if let Err(e) = session::save(
+                &root, focused_panel_id, next_panel_id, font_size,
+                rl.get_screen_width(), rl.get_screen_height(),
+                win_pos.x as i32, win_pos.y as i32,
+            ) {
+                eprintln!("[TAI] Autosave failed: {e}");
+            }
+            last_autosave = Instant::now();
+        }
         // Handle resize
         if rl.is_window_resized() {
             let w = rl.get_screen_width();
@@ -980,6 +1142,12 @@ fn main() {
                     ("e", "Edit command"),
                     ("Esc", "Cancel"),
                 ]),
+                ("Session (CLI flags)", &[
+                    ("--export <name>", "Export session"),
+                    ("--import <name>", "Import session"),
+                    ("--reset", "Reset session"),
+                    ("--list-sessions", "List saved sessions"),
+                ]),
             ];
 
             let title_h = cell_height + 8;
@@ -1079,5 +1247,15 @@ fn main() {
             panel_info,
             &mut d,
         );
+    }
+
+    // Save session on exit (all vars still alive, Drop not yet fired)
+    let win_pos = unsafe { raylib::ffi::GetWindowPosition() };
+    if let Err(e) = session::save(
+        &root, focused_panel_id, next_panel_id, font_size,
+        rl.get_screen_width(), rl.get_screen_height(),
+        win_pos.x as i32, win_pos.y as i32,
+    ) {
+        eprintln!("[TAI] Failed to save session on exit: {e}");
     }
 }

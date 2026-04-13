@@ -463,6 +463,28 @@ impl InputRouter {
         self.ai_bridge.is_some()
     }
 
+    pub fn unified_history(&self) -> &Vec<String> {
+        &self.unified_history
+    }
+
+    pub fn command_history(&self) -> &Vec<String> {
+        &self.command_history
+    }
+
+    pub fn conversation_messages(&self) -> &std::collections::VecDeque<async_openai::types::ChatCompletionRequestMessage> {
+        self.conversation.messages()
+    }
+
+    pub fn restore_history(&mut self, unified: Vec<String>, commands: Vec<String>, auto_exec: bool) {
+        self.unified_history = unified;
+        self.command_history = commands;
+        self.config.ai.auto_execute = auto_exec;
+    }
+
+    pub fn restore_conversation(&mut self, messages: Vec<async_openai::types::ChatCompletionRequestMessage>) {
+        self.conversation.push_restored(messages);
+    }
+
     fn dispatch_next_tool_call(
         &mut self,
         terminal: &mut Terminal,

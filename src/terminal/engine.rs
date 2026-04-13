@@ -18,6 +18,8 @@ pub struct Terminal {
     cell_width: i32,
     cell_height: i32,
     vt_mirror: Vec<u8>,
+    effects_ctx: *mut EffectsContext,
+    pub last_osc_title: String,
 }
 
 pub enum PtyReadResult {
@@ -26,13 +28,13 @@ pub enum PtyReadResult {
     Error,
 }
 
-#[repr(C)]
 struct EffectsContext {
     pty_fd: i32,
     cell_width: i32,
     cell_height: i32,
     cols: u16,
     rows: u16,
+    title_ptr: *mut String,
 }
 
 unsafe extern "C" fn effect_write_pty(
@@ -94,9 +96,10 @@ unsafe extern "C" fn effect_xtversion(
 
 unsafe extern "C" fn effect_title_changed(
     terminal: GhosttyTerminal,
-    _userdata: *mut std::ffi::c_void,
+    userdata: *mut std::ffi::c_void,
 ) {
     unsafe {
+        let ctx = &*(userdata as *const EffectsContext);
         let mut title = GhosttyString {
             ptr: ptr::null(),
             len: 0,
@@ -110,9 +113,9 @@ unsafe extern "C" fn effect_title_changed(
             if !title.ptr.is_null() && title.len > 0 {
                 let slice = std::slice::from_raw_parts(title.ptr, title.len);
                 if let Ok(s) = std::str::from_utf8(slice) {
-                    let prefixed = format!("Terminal AI - {}", s);
-                    let c_str = std::ffi::CString::new(prefixed).unwrap_or_default();
-                    raylib::ffi::SetWindowTitle(c_str.as_ptr());
+                    if !ctx.title_ptr.is_null() {
+                        *ctx.title_ptr = s.to_string();
+                    }
                 }
             }
         }
@@ -242,6 +245,8 @@ impl Terminal {
                 cell_width: 0,
                 cell_height: 0,
                 vt_mirror: Vec::with_capacity(4096),
+                effects_ctx: ptr::null_mut(),
+                last_osc_title: String::new(),
             })
         }
     }
@@ -251,6 +256,10 @@ impl Terminal {
         self.cell_width = cell_width;
         self.cell_height = cell_height;
 
+        if !self.effects_ctx.is_null() {
+            unsafe { drop(Box::from_raw(self.effects_ctx)); }
+        }
+
         unsafe {
             let ctx = Box::new(EffectsContext {
                 pty_fd,
@@ -258,8 +267,10 @@ impl Terminal {
                 cell_height,
                 cols: self.cols,
                 rows: self.rows,
+                title_ptr: &mut self.last_osc_title as *mut String,
             });
             let ctx_ptr = Box::into_raw(ctx);
+            self.effects_ctx = ctx_ptr;
 
             ghostty_terminal_set(
                 self.handle,
@@ -325,6 +336,14 @@ impl Terminal {
     pub fn resize(&mut self, cols: u16, rows: u16, cw: u32, ch: u32) {
         self.cols = cols;
         self.rows = rows;
+        if !self.effects_ctx.is_null() {
+            unsafe {
+                (*self.effects_ctx).cols = cols;
+                (*self.effects_ctx).rows = rows;
+                (*self.effects_ctx).cell_width = cw as i32;
+                (*self.effects_ctx).cell_height = ch as i32;
+            }
+        }
         unsafe {
             ghostty_terminal_resize(self.handle, cols, rows, cw, ch);
         }
@@ -539,6 +558,10 @@ impl Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         unsafe {
+            if !self.effects_ctx.is_null() {
+                drop(Box::from_raw(self.effects_ctx));
+                self.effects_ctx = ptr::null_mut();
+            }
             if let Some(f) = self.formatter {
                 ghostty_formatter_free(f);
             }

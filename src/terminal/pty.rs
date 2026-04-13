@@ -224,6 +224,8 @@ impl Drop for Pty {
     fn drop(&mut self) {
         unsafe {
             libc::close(self.master_fd);
+            libc::kill(self.child_pid.as_raw(), libc::SIGHUP);
+            libc::waitpid(self.child_pid.as_raw(), std::ptr::null_mut(), libc::WNOHANG);
         }
     }
 }

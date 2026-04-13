@@ -39,7 +39,10 @@ impl AiBridge {
         let key = api_key.to_string();
 
         let runtime_thread = std::thread::spawn(move || {
-            let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime");
             let client = AiClient::new(&key, &model);
 
             rt.block_on(async {

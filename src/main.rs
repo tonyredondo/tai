@@ -11,19 +11,17 @@ mod overlay;
 mod router;
 mod selection;
 mod status_bar;
+mod tab;
+mod tab_bar;
 mod terminal;
 
-use ai::bridge::AiBridge;
 use config::TaiConfig;
-use minimap::Minimap;
-use overlay::CommandOverlay;
-use router::{InputMode, InputRouter};
+use router::InputMode;
 use selection::TextSelection;
 use status_bar::StatusBar;
-use terminal::engine::{PtyReadResult, Terminal};
-use terminal::pty::Pty;
+use tab::TabSession;
+use tab_bar::{TabBar, TabBarAction};
 use raylib::prelude::*;
-use nix::libc;
 
 const FONT_DATA: &[u8] = include_bytes!("../fonts/JetBrainsMono-Regular.ttf");
 
@@ -73,31 +71,31 @@ fn load_font(font_size: i32, dpi_scale: f32, codepoints: &mut Vec<i32>) -> FontM
 
 fn build_terminal_codepoints() -> Vec<i32> {
     let mut cps: Vec<i32> = Vec::with_capacity(3000);
-    cps.extend(32..=126);          // Basic Latin (ASCII)
-    cps.extend(160..=255);         // Latin-1 Supplement
-    cps.extend(0x100..=0x17F);     // Latin Extended-A
-    cps.extend(0x180..=0x24F);     // Latin Extended-B
-    cps.extend(0x2000..=0x206F);   // General Punctuation
-    cps.extend(0x2070..=0x209F);   // Superscripts/Subscripts
-    cps.extend(0x20A0..=0x20CF);   // Currency Symbols
-    cps.extend(0x2100..=0x214F);   // Letterlike Symbols
-    cps.extend(0x2150..=0x218F);   // Number Forms
-    cps.extend(0x2190..=0x21FF);   // Arrows
-    cps.extend(0x2200..=0x22FF);   // Mathematical Operators
-    cps.extend(0x2300..=0x23FF);   // Miscellaneous Technical
-    cps.extend(0x2400..=0x243F);   // Control Pictures
-    cps.extend(0x2460..=0x24FF);   // Enclosed Alphanumerics
-    cps.extend(0x2500..=0x257F);   // Box Drawing
-    cps.extend(0x2580..=0x259F);   // Block Elements
-    cps.extend(0x25A0..=0x25FF);   // Geometric Shapes
-    cps.extend(0x2600..=0x26FF);   // Miscellaneous Symbols
-    cps.extend(0x2700..=0x27BF);   // Dingbats
-    cps.extend(0x27C0..=0x27FF);   // Supplemental Arrows-A
-    cps.extend(0x2800..=0x28FF);   // Braille Patterns
-    cps.extend(0x2900..=0x297F);   // Supplemental Arrows-B
-    cps.extend(0xE0A0..=0xE0D4);   // Powerline Symbols
-    cps.extend(0xE200..=0xE2FF);   // Extra terminal symbols
-    cps.extend(0xF000..=0xF0FF);   // Private Use Area (common)
+    cps.extend(32..=126);
+    cps.extend(160..=255);
+    cps.extend(0x100..=0x17F);
+    cps.extend(0x180..=0x24F);
+    cps.extend(0x2000..=0x206F);
+    cps.extend(0x2070..=0x209F);
+    cps.extend(0x20A0..=0x20CF);
+    cps.extend(0x2100..=0x214F);
+    cps.extend(0x2150..=0x218F);
+    cps.extend(0x2190..=0x21FF);
+    cps.extend(0x2200..=0x22FF);
+    cps.extend(0x2300..=0x23FF);
+    cps.extend(0x2400..=0x243F);
+    cps.extend(0x2460..=0x24FF);
+    cps.extend(0x2500..=0x257F);
+    cps.extend(0x2580..=0x259F);
+    cps.extend(0x25A0..=0x25FF);
+    cps.extend(0x2600..=0x26FF);
+    cps.extend(0x2700..=0x27BF);
+    cps.extend(0x27C0..=0x27FF);
+    cps.extend(0x2800..=0x28FF);
+    cps.extend(0x2900..=0x297F);
+    cps.extend(0xE0A0..=0xE0D4);
+    cps.extend(0xE200..=0xE2FF);
+    cps.extend(0xF000..=0xF0FF);
     cps
 }
 
@@ -140,6 +138,12 @@ fn extract_selected_text(sel: &TextSelection, rows: &[String]) -> String {
     result
 }
 
+fn calc_term_size(w: i32, h: i32, pad: i32, minimap_width: i32, tab_bar_height: i32, status_bar_height: i32, cell_width: i32, cell_height: i32) -> (u16, u16) {
+    let cols = ((w - 2 * pad - minimap_width) / cell_width).max(1) as u16;
+    let rows = (((h - status_bar_height - tab_bar_height) - 2 * pad) / cell_height).max(1) as u16;
+    (cols, rows)
+}
+
 fn main() {
     let config = TaiConfig::load();
     let default_font_size = config.terminal.font_size;
@@ -173,90 +177,71 @@ fn main() {
     let pad = 4;
     let minimap_width = 40;
     let mut status_bar_height = font_size + 8;
+    let mut tab_bar = TabBar::new(cell_height);
+    let tab_bar_height = tab_bar.height;
 
     let scr_w = rl.get_screen_width();
     let scr_h = rl.get_screen_height();
-    let term_cols = ((scr_w - 2 * pad - minimap_width) / cell_width).max(1) as u16;
-    let term_rows = (((scr_h - status_bar_height) - 2 * pad) / cell_height).max(1) as u16;
+    let (term_cols, term_rows) = calc_term_size(scr_w, scr_h, pad, minimap_width, tab_bar_height, status_bar_height, cell_width, cell_height);
 
-    let mut term = match Terminal::new(term_cols, term_rows, config.terminal.scrollback) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Failed to create terminal: {e}");
-            return;
-        }
-    };
-
-    let pty = match Pty::spawn(term_cols, term_rows, cell_width, cell_height) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Failed to spawn PTY: {e}");
-            return;
-        }
-    };
-
-    term.setup_effects(pty.master_fd(), cell_width, cell_height);
-    term.resize(term_cols, term_rows, cell_width as u32, cell_height as u32);
-
-    let ai_bridge = config.api_key().map(|key| AiBridge::new(&config.ai, &key));
-    let ai_available = ai_bridge.is_some();
-
-    let mut router = InputRouter::new(&config, ai_bridge);
-    let mut overlay = CommandOverlay::new();
+    let ai_available = config.api_key().is_some();
     let status_bar = StatusBar::new(&config.ai.model, ai_available);
-    let mut text_selection = TextSelection::new();
 
-    let mut minimap = Minimap::new(term_cols);
-    let mut pty_mirror: Vec<u8> = Vec::with_capacity(8192);
+    let mut tabs: Vec<TabSession> = Vec::new();
+    match TabSession::new(&config, term_cols, term_rows, cell_width, cell_height) {
+        Ok(t) => tabs.push(t),
+        Err(e) => {
+            eprintln!("Failed to create tab: {e}");
+            return;
+        }
+    }
+    let mut active_tab: usize = 0;
 
     let mut prev_width = scr_w;
     let mut prev_height = scr_h;
-    let mut child_exited = false;
     let mut title_frame: u32 = 0;
     let mut last_title = String::new();
 
-    // Disable Raylib's default Escape-to-close so Esc can be used for AI prompt cancel
     unsafe { raylib::ffi::SetExitKey(0); }
 
     while !rl.window_should_close() {
+        if tabs.is_empty() {
+            break;
+        }
+
         // Handle resize
         if rl.is_window_resized() {
             let w = rl.get_screen_width();
             let h = rl.get_screen_height();
             if w != prev_width || h != prev_height {
-                let cols = ((w - 2 * pad - minimap_width) / cell_width).max(1) as u16;
-                let rows = (((h - status_bar_height) - 2 * pad) / cell_height).max(1) as u16;
-                term.resize(cols, rows, cell_width as u32, cell_height as u32);
-                pty.resize(cols, rows, cell_width, cell_height);
-                minimap.set_cols(cols);
-                let buffer_text = term.get_buffer_text(0);
-                minimap.rebuild_from_text(&buffer_text);
+                let (cols, rows) = calc_term_size(w, h, pad, minimap_width, tab_bar.height, status_bar_height, cell_width, cell_height);
+                for tab in &mut tabs {
+                    tab.resize(cols, rows, cell_width as u32, cell_height as u32);
+                }
                 prev_width = w;
                 prev_height = h;
             }
         }
 
-        // Read PTY
-        if !child_exited {
-            let capture = router.capture_buffer();
-            match pty.read_nonblocking(&mut term, capture, Some(&mut pty_mirror)) {
-                PtyReadResult::Ok => {}
-                PtyReadResult::Eof | PtyReadResult::Error => {
-                    child_exited = true;
-                }
-            }
-            if !pty_mirror.is_empty() {
-                minimap.feed(&pty_mirror);
-                pty_mirror.clear();
-            }
+        // Read PTY for ALL tabs
+        for tab in &mut tabs {
+            tab.read_pty();
         }
 
-        // Update window title with foreground process name (~every 30 frames)
+        // Poll AI for ALL tabs
+        for tab in &mut tabs {
+            tab.poll_ai();
+        }
+
+        // Update window title from active tab (~every 30 frames)
         title_frame += 1;
         if title_frame % 30 == 0 {
-            let new_title = match pty.get_foreground_process_name() {
-                Some(name) => format!("Terminal AI - {}", name),
-                None => "Terminal AI".to_string(),
+            let tab = &tabs[active_tab];
+            let tab_title = tab.title();
+            let new_title = if tab_title == "shell" {
+                "Terminal AI".to_string()
+            } else {
+                format!("Terminal AI - {}", tab_title)
             };
             if new_title != last_title {
                 let c_title = std::ffi::CString::new(new_title.as_str()).unwrap_or_default();
@@ -265,244 +250,321 @@ fn main() {
             }
         }
 
-        // Cmd+Plus / Cmd+Minus / Cmd+0 for font size
+        // Key modifiers
         let cmd_held = rl.is_key_down(KeyboardKey::KEY_LEFT_SUPER)
             || rl.is_key_down(KeyboardKey::KEY_RIGHT_SUPER);
-
-        let font_size_change = if cmd_held && (rl.is_key_pressed(KeyboardKey::KEY_EQUAL) || rl.is_key_pressed(KeyboardKey::KEY_KP_ADD)) {
-            Some((font_size + 2).min(72))
-        } else if cmd_held && (rl.is_key_pressed(KeyboardKey::KEY_MINUS) || rl.is_key_pressed(KeyboardKey::KEY_KP_SUBTRACT)) {
-            Some((font_size - 2).max(8))
-        } else if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_ZERO) {
-            Some(default_font_size)
-        } else {
-            None
-        };
-
-        if let Some(new_size) = font_size_change {
-            font_size = new_size;
-            let old_font = mono_font;
-            metrics = load_font(font_size, dpi_scale, &mut codepoints);
-            mono_font = metrics.font;
-            cell_width = metrics.cell_width;
-            cell_height = metrics.cell_height;
-            status_bar_height = font_size + 8;
-            unsafe { raylib::ffi::UnloadFont(old_font); }
-            let w = rl.get_screen_width();
-            let h = rl.get_screen_height();
-            let cols = ((w - 2 * pad - minimap_width) / cell_width).max(1) as u16;
-            let rows = (((h - status_bar_height) - 2 * pad) / cell_height).max(1) as u16;
-            term.resize(cols, rows, cell_width as u32, cell_height as u32);
-            pty.resize(cols, rows, cell_width, cell_height);
-            minimap.set_cols(cols);
-            let buffer_text = term.get_buffer_text(0);
-            minimap.rebuild_from_text(&buffer_text);
-        }
-
-        // Cmd+C = copy selection, Cmd+V = paste
-        if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_C) {
-            if text_selection.has_selection() {
-                let rows = term.get_viewport_rows();
-                let selected = extract_selected_text(&text_selection, &rows);
-                if !selected.is_empty() {
-                    selection::copy_to_clipboard(&selected);
-                }
-                text_selection.clear();
-            }
-        }
-        if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_V) {
-            if let Some(text) = selection::paste_from_clipboard() {
-                if !text.is_empty() {
-                    pty.write(text.as_bytes());
-                }
-            }
-        }
-
-        // Mouse: minimap click-to-scroll or text selection
-        {
-            let mut mouse_tracking = false;
-            unsafe {
-                bindings::ghostty_terminal_get(
-                    term.handle(),
-                    bindings::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING,
-                    &mut mouse_tracking as *mut bool as *mut std::ffi::c_void,
-                );
-            }
-            let mx = rl.get_mouse_x();
-            let my = rl.get_mouse_y();
-            let scr_w_now = rl.get_screen_width();
-            let in_minimap = mx >= scr_w_now - minimap.width;
-
-            if in_minimap || minimap.dragging {
-                if let Some((total, offset, len)) = term.get_scrollbar() {
-                    let scr_h_now = rl.get_screen_height();
-                    if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
-                        let delta = minimap.handle_mouse_press(my, scr_h_now, status_bar_height, total, offset, len);
-                        if delta != 0 {
-                            term.scroll_viewport(delta);
-                        }
-                    } else if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) && minimap.dragging {
-                        let delta = minimap.handle_mouse_drag(my, scr_h_now, status_bar_height, total, offset, len);
-                        if delta != 0 {
-                            term.scroll_viewport(delta);
-                        }
-                    }
-                }
-                if rl.is_mouse_button_released(MouseButton::MOUSE_BUTTON_LEFT) {
-                    minimap.handle_mouse_release();
-                }
-            } else if !mouse_tracking {
-                let (col, row) = selection::mouse_to_cell(mx, my, cell_width, cell_height, pad);
-
-                if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
-                    text_selection.begin(col, row);
-                } else if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) && text_selection.active {
-                    text_selection.update(col, row);
-                } else if rl.is_mouse_button_released(MouseButton::MOUSE_BUTTON_LEFT) && text_selection.active {
-                    text_selection.update(col, row);
-                    text_selection.finish();
-                }
-            }
-        }
-
-        // Input handling based on mode
-        let mode = router.mode();
-
+        let shift_held = rl.is_key_down(KeyboardKey::KEY_LEFT_SHIFT)
+            || rl.is_key_down(KeyboardKey::KEY_RIGHT_SHIFT);
         let ctrl_held = rl.is_key_down(KeyboardKey::KEY_LEFT_CONTROL)
             || rl.is_key_down(KeyboardKey::KEY_RIGHT_CONTROL);
 
-        // Ctrl+/ = AI prompt toggle
-        if ctrl_held && rl.is_key_pressed(KeyboardKey::KEY_SLASH) {
-            router.toggle_ai_mode();
-        // Ctrl+Y = YOLO mode toggle (auto-execute)
-        } else if ctrl_held && rl.is_key_pressed(KeyboardKey::KEY_Y) {
-            router.toggle_auto_execute();
+        // Tab management keybindings
+        if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_T) {
+            let (cols, rows) = calc_term_size(
+                rl.get_screen_width(), rl.get_screen_height(),
+                pad, minimap_width, tab_bar.height, status_bar_height,
+                cell_width, cell_height,
+            );
+            if let Ok(t) = TabSession::new(&config, cols, rows, cell_width, cell_height) {
+                tabs.push(t);
+                active_tab = tabs.len() - 1;
+            }
+        } else if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_W) {
+            tabs.remove(active_tab);
+            if tabs.is_empty() {
+                break;
+            }
+            active_tab = active_tab.min(tabs.len() - 1);
+            last_title.clear();
+        } else if cmd_held && shift_held && rl.is_key_pressed(KeyboardKey::KEY_RIGHT_BRACKET) {
+            active_tab = (active_tab + 1) % tabs.len();
+            last_title.clear();
+        } else if cmd_held && shift_held && rl.is_key_pressed(KeyboardKey::KEY_LEFT_BRACKET) {
+            active_tab = if active_tab == 0 { tabs.len() - 1 } else { active_tab - 1 };
+            last_title.clear();
         } else {
-            match mode {
-                InputMode::Shell => {
-                    if !child_exited {
-                        let chars = terminal::input::handle_input(&rl, &mut term, &pty);
-                        for c in chars {
-                            router.track_shell_char(c);
-                        }
-                        terminal::input::handle_mouse(&rl, &mut term, &pty, cell_width, cell_height, pad);
+            // Cmd+1..9 jump to tab
+            let mut tab_jump = false;
+            if cmd_held {
+                let key_nums = [
+                    KeyboardKey::KEY_ONE, KeyboardKey::KEY_TWO, KeyboardKey::KEY_THREE,
+                    KeyboardKey::KEY_FOUR, KeyboardKey::KEY_FIVE, KeyboardKey::KEY_SIX,
+                    KeyboardKey::KEY_SEVEN, KeyboardKey::KEY_EIGHT, KeyboardKey::KEY_NINE,
+                ];
+                for (i, &key) in key_nums.iter().enumerate() {
+                    if rl.is_key_pressed(key) && i < tabs.len() {
+                        active_tab = i;
+                        last_title.clear();
+                        tab_jump = true;
+                        break;
                     }
                 }
-                InputMode::AiPrompt => {
-                    let ctrl = rl.is_key_down(KeyboardKey::KEY_LEFT_CONTROL)
-                        || rl.is_key_down(KeyboardKey::KEY_RIGHT_CONTROL);
+            }
 
-                    // Ctrl+J inserts a newline
-                    if ctrl && rl.is_key_pressed(KeyboardKey::KEY_J) {
-                        router.handle_ai_prompt_char('\n');
+            if !tab_jump {
+                // Font size change
+                let font_size_change = if cmd_held && (rl.is_key_pressed(KeyboardKey::KEY_EQUAL) || rl.is_key_pressed(KeyboardKey::KEY_KP_ADD)) {
+                    Some((font_size + 2).min(72))
+                } else if cmd_held && (rl.is_key_pressed(KeyboardKey::KEY_MINUS) || rl.is_key_pressed(KeyboardKey::KEY_KP_SUBTRACT)) {
+                    Some((font_size - 2).max(8))
+                } else if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_ZERO) {
+                    Some(default_font_size)
+                } else {
+                    None
+                };
+
+                if let Some(new_size) = font_size_change {
+                    font_size = new_size;
+                    let old_font = mono_font;
+                    metrics = load_font(font_size, dpi_scale, &mut codepoints);
+                    mono_font = metrics.font;
+                    cell_width = metrics.cell_width;
+                    cell_height = metrics.cell_height;
+                    status_bar_height = font_size + 8;
+                    tab_bar.update_height(cell_height);
+                    unsafe { raylib::ffi::UnloadFont(old_font); }
+                    let w = rl.get_screen_width();
+                    let h = rl.get_screen_height();
+                    let (cols, rows) = calc_term_size(w, h, pad, minimap_width, tab_bar.height, status_bar_height, cell_width, cell_height);
+                    for tab in &mut tabs {
+                        tab.resize(cols, rows, cell_width as u32, cell_height as u32);
+                    }
+                }
+
+                // Copy/Paste (active tab)
+                let tab = &mut tabs[active_tab];
+                if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_C) {
+                    if tab.selection.has_selection() {
+                        let rows = tab.term.get_viewport_rows();
+                        let selected = extract_selected_text(&tab.selection, &rows);
+                        if !selected.is_empty() {
+                            selection::copy_to_clipboard(&selected);
+                        }
+                        tab.selection.clear();
+                    }
+                }
+                if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_V) {
+                    if let Some(text) = selection::paste_from_clipboard() {
+                        if !text.is_empty() {
+                            tab.pty.write(text.as_bytes());
+                        }
+                    }
+                }
+
+                // Mouse handling
+                {
+                    let mx = rl.get_mouse_x();
+                    let my = rl.get_mouse_y();
+                    let scr_w_now = rl.get_screen_width();
+                    let scr_h_now = rl.get_screen_height();
+
+                    if my < tab_bar.height {
+                        // Tab bar area
+                        if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
+                            match tab_bar.handle_click(mx, my, scr_w_now, tabs.len()) {
+                                TabBarAction::SwitchTo(idx) => {
+                                    active_tab = idx;
+                                    last_title.clear();
+                                }
+                                TabBarAction::Close(idx) => {
+                                    tabs.remove(idx);
+                                    if tabs.is_empty() {
+                                        break;
+                                    }
+                                    active_tab = active_tab.min(tabs.len() - 1);
+                                    last_title.clear();
+                                }
+                                TabBarAction::New => {
+                                    let (cols, rows) = calc_term_size(
+                                        scr_w_now, scr_h_now, pad, minimap_width,
+                                        tab_bar.height, status_bar_height, cell_width, cell_height,
+                                    );
+                                    if let Ok(t) = TabSession::new(&config, cols, rows, cell_width, cell_height) {
+                                        tabs.push(t);
+                                        active_tab = tabs.len() - 1;
+                                        last_title.clear();
+                                    }
+                                }
+                                TabBarAction::None => {}
+                            }
+                        }
                     } else {
-                        loop {
-                            let ch = unsafe { raylib::ffi::GetCharPressed() };
-                            if ch == 0 { break; }
-                            if ch == 0x0A { continue; } // skip raw \n from Ctrl+J
-                            if let Some(c) = char::from_u32(ch as u32) {
-                                router.handle_ai_prompt_char(c);
+                        let tab = &mut tabs[active_tab];
+                        let mut mouse_tracking = false;
+                        unsafe {
+                            bindings::ghostty_terminal_get(
+                                tab.term.handle(),
+                                bindings::GhosttyTerminalData_GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING,
+                                &mut mouse_tracking as *mut bool as *mut std::ffi::c_void,
+                            );
+                        }
+                        let in_minimap = mx >= scr_w_now - tab.minimap.width;
+
+                        if in_minimap || tab.minimap.dragging {
+                            if let Some((total, offset, len)) = tab.term.get_scrollbar() {
+                                if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
+                                    let delta = tab.minimap.handle_mouse_press(my, scr_h_now, status_bar_height + tab_bar.height, total, offset, len);
+                                    if delta != 0 { tab.term.scroll_viewport(delta); }
+                                } else if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) && tab.minimap.dragging {
+                                    let delta = tab.minimap.handle_mouse_drag(my, scr_h_now, status_bar_height + tab_bar.height, total, offset, len);
+                                    if delta != 0 { tab.term.scroll_viewport(delta); }
+                                }
+                            }
+                            if rl.is_mouse_button_released(MouseButton::MOUSE_BUTTON_LEFT) {
+                                tab.minimap.handle_mouse_release();
+                            }
+                        } else if !mouse_tracking {
+                            let (col, row) = selection::mouse_to_cell(mx, my - tab_bar.height, cell_width, cell_height, pad);
+                            if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
+                                tab.selection.begin(col, row);
+                            } else if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) && tab.selection.active {
+                                tab.selection.update(col, row);
+                            } else if rl.is_mouse_button_released(MouseButton::MOUSE_BUTTON_LEFT) && tab.selection.active {
+                                tab.selection.update(col, row);
+                                tab.selection.finish();
                             }
                         }
                     }
-                    if rl.is_key_pressed(KeyboardKey::KEY_BACKSPACE)
-                        || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_BACKSPACE as i32) }
-                    {
-                        router.handle_ai_prompt_backspace();
-                    }
-                    if rl.is_key_pressed(KeyboardKey::KEY_UP)
-                        || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_UP as i32) }
-                    {
-                        router.handle_ai_prompt_history_up();
-                    }
-                    if rl.is_key_pressed(KeyboardKey::KEY_DOWN)
-                        || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_DOWN as i32) }
-                    {
-                        router.handle_ai_prompt_history_down();
-                    }
-                    if rl.is_key_pressed(KeyboardKey::KEY_ENTER) && !ctrl {
-                        router.handle_ai_prompt_submit(&mut term, &pty);
-                    }
-                    if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
-                        router.handle_ai_prompt_cancel();
-                    }
                 }
-                InputMode::AiStreaming => {
-                    if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
-                        // TODO: send cancel request
-                    }
-                }
-                InputMode::CommandConfirm => {
-                    if rl.is_key_pressed(KeyboardKey::KEY_ENTER) {
-                        router.handle_command_confirm_enter(&mut term, &pty, &mut overlay);
-                    } else if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
-                        router.handle_command_confirm_cancel(&pty, &mut overlay);
-                    } else if rl.is_key_pressed(KeyboardKey::KEY_E) {
-                        router.handle_command_confirm_edit(&pty, &mut overlay);
+
+                // Input handling based on mode (active tab)
+                let tab = &mut tabs[active_tab];
+                let mode = tab.router.mode();
+
+                if ctrl_held && rl.is_key_pressed(KeyboardKey::KEY_SLASH) {
+                    tab.router.toggle_ai_mode();
+                } else if ctrl_held && rl.is_key_pressed(KeyboardKey::KEY_Y) {
+                    tab.router.toggle_auto_execute();
+                } else {
+                    match mode {
+                        InputMode::Shell => {
+                            if !tab.child_exited {
+                                let chars = terminal::input::handle_input(&rl, &mut tab.term, &tab.pty);
+                                for c in chars {
+                                    tab.router.track_shell_char(c);
+                                }
+                                terminal::input::handle_mouse(&rl, &mut tab.term, &tab.pty, cell_width, cell_height, pad + tab_bar.height);
+                            }
+                        }
+                        InputMode::AiPrompt => {
+                            let ctrl = rl.is_key_down(KeyboardKey::KEY_LEFT_CONTROL)
+                                || rl.is_key_down(KeyboardKey::KEY_RIGHT_CONTROL);
+                            if ctrl && rl.is_key_pressed(KeyboardKey::KEY_J) {
+                                tab.router.handle_ai_prompt_char('\n');
+                            } else {
+                                loop {
+                                    let ch = unsafe { raylib::ffi::GetCharPressed() };
+                                    if ch == 0 { break; }
+                                    if ch == 0x0A { continue; }
+                                    if let Some(c) = char::from_u32(ch as u32) {
+                                        tab.router.handle_ai_prompt_char(c);
+                                    }
+                                }
+                            }
+                            if rl.is_key_pressed(KeyboardKey::KEY_BACKSPACE)
+                                || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_BACKSPACE as i32) }
+                            {
+                                tab.router.handle_ai_prompt_backspace();
+                            }
+                            if rl.is_key_pressed(KeyboardKey::KEY_UP)
+                                || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_UP as i32) }
+                            {
+                                tab.router.handle_ai_prompt_history_up();
+                            }
+                            if rl.is_key_pressed(KeyboardKey::KEY_DOWN)
+                                || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_DOWN as i32) }
+                            {
+                                tab.router.handle_ai_prompt_history_down();
+                            }
+                            if rl.is_key_pressed(KeyboardKey::KEY_ENTER) && !ctrl {
+                                tab.router.handle_ai_prompt_submit(&mut tab.term, &tab.pty);
+                            }
+                            if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
+                                tab.router.handle_ai_prompt_cancel();
+                            }
+                        }
+                        InputMode::AiStreaming => {
+                            if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
+                                // TODO: cancel
+                            }
+                        }
+                        InputMode::CommandConfirm => {
+                            if rl.is_key_pressed(KeyboardKey::KEY_ENTER) {
+                                tab.router.handle_command_confirm_enter(&mut tab.term, &tab.pty, &mut tab.overlay);
+                            } else if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
+                                tab.router.handle_command_confirm_cancel(&tab.pty, &mut tab.overlay);
+                            } else if rl.is_key_pressed(KeyboardKey::KEY_E) {
+                                tab.router.handle_command_confirm_edit(&tab.pty, &mut tab.overlay);
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Poll AI responses
-        router.poll_ai_responses(&mut term, &pty, &mut overlay);
+        // Collect info before mutable borrow for rendering
+        let tab_titles: Vec<String> = tabs.iter().map(|t| t.title()).collect();
+        let tab_count = tabs.len();
 
-        if let Some(vt_data) = term.drain_vt_mirror() {
-            minimap.feed(&vt_data);
-        }
+        // Render active tab
+        let tab = &mut tabs[active_tab];
+        tab.term.update_render_state();
 
-        // Update render state
-        term.update_render_state();
-
-        // Get background color
         let bg_color = unsafe {
             let mut colors: bindings::GhosttyRenderStateColors = std::mem::zeroed();
             colors.size = std::mem::size_of::<bindings::GhosttyRenderStateColors>();
-            bindings::ghostty_render_state_colors_get(term.render_state(), &mut colors);
+            bindings::ghostty_render_state_colors_get(tab.term.render_state(), &mut colors);
             Color::new(colors.background.r, colors.background.g, colors.background.b, 255)
         };
 
-        let cwd_str = pty
+        let cwd_str = tab.pty
             .get_cwd()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "~".to_string());
 
-        // Render
+        let active_mode = tab.router.mode();
+        let ai_input = tab.router.ai_input_buffer().to_string();
+        let auto_exec = tab.router.auto_execute();
+        let child_exited = tab.child_exited;
+
         let mut d = rl.begin_drawing(&thread);
         d.clear_background(bg_color);
 
+        // Tab bar
+        tab_bar.render(&tab_titles, active_tab, &mono_font, font_size, d.get_screen_width(), &mut d);
+
+        // Terminal grid (offset by tab bar height)
         terminal::renderer::render_terminal(
-            term.render_state(),
-            term.row_iter(),
-            term.row_cells(),
+            tab.term.render_state(),
+            tab.term.row_iter(),
+            tab.term.row_cells(),
             &mono_font,
             cell_width,
             cell_height,
             font_size,
-            pad,
-            term.handle(),
+            pad + tab_bar.height,
+            tab.term.handle(),
             &mut d,
         );
 
-        // Draw minimap
-        if let Some((total, offset, len)) = term.get_scrollbar() {
+        // Minimap
+        if let Some((total, offset, len)) = tab.term.get_scrollbar() {
             let scr_w = d.get_screen_width();
             let scr_h = d.get_screen_height();
-            minimap.render(total, offset, len, scr_w, scr_h, status_bar_height, pad, &mut d);
+            tab.minimap.render(total, offset, len, scr_w, scr_h, status_bar_height + tab_bar.height, pad, &mut d);
         }
 
-        // Draw text selection highlight
-        if text_selection.has_selection() {
+        // Text selection highlight
+        if tab.selection.has_selection() {
             let scr_w = d.get_screen_width();
             let term_cols = (scr_w - 2 * pad) / cell_width;
             let scr_h = d.get_screen_height();
-            let term_rows = ((scr_h - status_bar_height) - 2 * pad) / cell_height;
-            text_selection.render(cell_width, cell_height, pad, term_cols, term_rows, &mut d);
+            let term_rows = ((scr_h - status_bar_height - tab_bar.height) - 2 * pad) / cell_height;
+            tab.selection.render(cell_width, cell_height, pad + tab_bar.height, term_cols, term_rows, &mut d);
         }
 
-        // Draw floating AI prompt panel
-        if router.mode() == InputMode::AiPrompt {
-            let input = router.ai_input_buffer();
+        // Floating AI prompt panel
+        if active_mode == InputMode::AiPrompt {
             let screen_w = d.get_screen_width();
             let screen_h = d.get_screen_height();
 
@@ -511,7 +573,7 @@ fn main() {
             let inner_pad = 12;
             let label_h = cell_height + 4;
 
-            let lines: Vec<&str> = input.split('\n').collect();
+            let lines: Vec<&str> = ai_input.split('\n').collect();
             let line_count = lines.len().max(1) as i32;
             let text_h = line_count * cell_height;
             let panel_h = label_h + text_h + inner_pad * 2 + 4;
@@ -572,7 +634,7 @@ fn main() {
             }
         }
 
-        overlay.render(
+        tab.overlay.render(
             &mono_font,
             d.get_screen_width(),
             d.get_screen_height(),
@@ -585,10 +647,11 @@ fn main() {
             d.get_screen_width(),
             d.get_screen_height(),
             font_size,
-            router.mode(),
+            active_mode,
             &cwd_str,
-            router.ai_input_buffer(),
-            router.auto_execute(),
+            &ai_input,
+            auto_exec,
+            if tab_count > 1 { Some((active_tab + 1, tab_count)) } else { None },
             &mut d,
         );
 
@@ -613,13 +676,5 @@ fn main() {
                 );
             }
         }
-    }
-
-    // Cleanup: send SIGHUP to child
-    unsafe {
-        if !child_exited {
-            libc::kill(pty.child_pid().as_raw(), libc::SIGHUP);
-        }
-        libc::waitpid(pty.child_pid().as_raw(), std::ptr::null_mut(), 0);
     }
 }

@@ -22,8 +22,9 @@ impl StatusBar {
         font_size: i32,
         mode: InputMode,
         cwd: &str,
-        ai_input: &str,
+        _ai_input: &str,
         auto_execute: bool,
+        tab_info: Option<(usize, usize)>,
         d: &mut RaylibDrawHandle,
     ) {
         let bar_h = font_size + 8;
@@ -50,29 +51,34 @@ impl StatusBar {
 
         d.draw_rectangle(0, bar_y, screen_w, bar_h, bg_color);
 
+        let tab_prefix = match tab_info {
+            Some((active, total)) => format!("Tab {}/{} | ", active, total),
+            None => String::new(),
+        };
+
         let text = match mode {
             InputMode::Shell => {
                 let yolo = if auto_execute { " | YOLO" } else { "" };
                 if self.ai_available {
                     format!(
-                        " [TAI] shell | model: {} | cwd: {} | Ctrl+/ for AI | Ctrl+Y YOLO{}",
-                        self.model, cwd, yolo
+                        " {}shell | model: {} | cwd: {} | Ctrl+/ AI | Cmd+T tab{}",
+                        tab_prefix, self.model, cwd, yolo
                     )
                 } else {
                     format!(
-                        " [TAI] shell | cwd: {} | Set OPENAI_API_KEY to enable AI",
-                        cwd
+                        " {}shell | cwd: {} | Set OPENAI_API_KEY to enable AI",
+                        tab_prefix, cwd
                     )
                 }
             }
             InputMode::AiPrompt => {
-                " [TAI] AI mode | Enter to submit | Ctrl+J for newline | Esc to cancel".to_string()
+                format!(" {}AI mode | Enter to submit | Ctrl+J newline | Esc cancel", tab_prefix)
             }
             InputMode::AiStreaming => {
-                " [TAI] AI responding...  (Esc to cancel)".to_string()
+                format!(" {}AI responding...  (Esc to cancel)", tab_prefix)
             }
             InputMode::CommandConfirm => {
-                " [TAI] Command confirmation  [Enter] Run | [Esc] Cancel | [e] Edit".to_string()
+                format!(" {}Command confirmation  [Enter] Run | [Esc] Cancel | [e] Edit", tab_prefix)
             }
         };
 

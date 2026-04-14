@@ -556,7 +556,7 @@ impl InputRouter {
 
     fn finish_command_capture(
         &mut self,
-        terminal: &mut Terminal,
+        _terminal: &mut Terminal,
         pty: &Pty,
     ) {
         let capture = match self.command_capture.take() {

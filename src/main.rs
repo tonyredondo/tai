@@ -199,8 +199,8 @@ extern "C" fn signal_handler(_sig: nix::libc::c_int) {
 
 fn main() {
     unsafe {
-        nix::libc::signal(nix::libc::SIGTERM, signal_handler as nix::libc::sighandler_t);
-        nix::libc::signal(nix::libc::SIGINT, signal_handler as nix::libc::sighandler_t);
+        nix::libc::signal(nix::libc::SIGTERM, signal_handler as *const () as nix::libc::sighandler_t);
+        nix::libc::signal(nix::libc::SIGINT, signal_handler as *const () as nix::libc::sighandler_t);
     }
 
     let config = TaiConfig::load();

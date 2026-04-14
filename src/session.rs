@@ -190,6 +190,81 @@ fn split_node_to_session(node: &SplitNode) -> SessionNode {
     }
 }
 
+fn is_vt_blank_line(line: &[u8]) -> bool {
+    let mut i = 0;
+    while i < line.len() {
+        match line[i] {
+            0x1b => {
+                i += 1;
+                if i < line.len() && line[i] == b'[' {
+                    i += 1;
+                    while i < line.len() && !(line[i] >= b'@' && line[i] <= b'~') {
+                        i += 1;
+                    }
+                    if i < line.len() {
+                        i += 1;
+                    }
+                } else if i < line.len() {
+                    i += 1;
+                }
+            }
+            b' ' | b'\t' | b'\r' => i += 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn strip_trailing_prompt(scrollback: &mut String) {
+    let mut search_start = scrollback.len().saturating_sub(4000);
+    while search_start > 0 && !scrollback.is_char_boundary(search_start) {
+        search_start -= 1;
+    }
+    let tail = scrollback[search_start..].as_bytes();
+
+    let mut line_boundaries: Vec<usize> = Vec::new();
+    for (i, &b) in tail.iter().enumerate() {
+        if b == b'\n' {
+            line_boundaries.push(i);
+        }
+    }
+
+    let mut trunc_pos = None;
+    for w in line_boundaries.windows(2).rev() {
+        let line_start = w[0] + 1;
+        let line_end = w[1];
+        let line = &tail[line_start..line_end];
+        let line = if line.last() == Some(&b'\r') {
+            &line[..line.len() - 1]
+        } else {
+            line
+        };
+        if is_vt_blank_line(line) {
+            trunc_pos = Some(search_start + line_start);
+            break;
+        }
+    }
+
+    if trunc_pos.is_none() && !line_boundaries.is_empty() {
+        let first_nl = line_boundaries[0];
+        let first_line = &tail[..first_nl];
+        let first_line = if first_line.last() == Some(&b'\r') {
+            &first_line[..first_line.len() - 1]
+        } else {
+            first_line
+        };
+        if is_vt_blank_line(first_line) {
+            trunc_pos = Some(search_start);
+        }
+    }
+
+    match trunc_pos {
+        Some(0) => scrollback.clear(),
+        Some(pos) => scrollback.truncate(pos),
+        None => scrollback.clear(),
+    }
+}
+
 fn tab_to_session(tab: &TabSession) -> SessionTab {
     let cwd = if tab.child_exited {
         String::new()
@@ -200,18 +275,17 @@ fn tab_to_session(tab: &TabSession) -> SessionTab {
             .unwrap_or_default()
     };
 
-    let mut scrollback = tab.term.get_buffer_vt();
+    // If we injected scrollback from a session load, use the original
+    // scrollback text for saving to prevent accumulation/corruption
+    // across save/load cycles.
+    let mut scrollback = if let Some(ref orig) = tab.original_scrollback {
+        orig.clone()
+    } else {
+        tab.term.get_buffer_vt()
+    };
 
-    if !tab.child_exited {
-        let search_start = scrollback.len().saturating_sub(4000);
-        let tail = &scrollback[search_start..];
-        if let Some(rel_pos) = tail.rfind("\r\n\r\n") {
-            scrollback.truncate(search_start + rel_pos + 2);
-        } else if let Some(rel_pos) = tail.rfind("\n\n") {
-            scrollback.truncate(search_start + rel_pos + 1);
-        } else {
-            scrollback.clear();
-        }
+    if !tab.child_exited && tab.original_scrollback.is_none() {
+        strip_trailing_prompt(&mut scrollback);
     }
 
     let line_count = scrollback.lines().count();
@@ -492,7 +566,6 @@ fn restore_tab(
     if st.child_exited {
         return TabSession::new_dead(config, &st.title, &st.scrollback, st.scroll_offset, cols, rows, cw, ch, &st.router);
     }
-    // Try spawn in saved CWD, fall back to default
     let cwd = PathBuf::from(&st.cwd);
     let result = if !st.cwd.is_empty() && cwd.is_dir() {
         TabSession::new_in_dir(config, cwd, cols, rows, cw, ch, &st.scrollback, st.scroll_offset, &st.router)

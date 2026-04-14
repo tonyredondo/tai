@@ -299,7 +299,32 @@ fn set_app_icon() {
     }
 }
 
+fn inherit_shell_env() {
+    if std::env::var("OPENAI_API_KEY").is_ok() {
+        return;
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let output = std::process::Command::new(&shell)
+        .args(["-l", "-c", "env"])
+        .output();
+    if let Ok(out) = output {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            if let Some((key, val)) = line.split_once('=') {
+                if key == "OPENAI_API_KEY"
+                    || key == "ANTHROPIC_API_KEY"
+                    || (key.starts_with("TAI_") && std::env::var(key).is_err())
+                {
+                    unsafe { std::env::set_var(key, val); }
+                }
+            }
+        }
+    }
+}
+
 fn main() {
+    inherit_shell_env();
+
     unsafe {
         nix::libc::signal(nix::libc::SIGTERM, signal_handler as *const () as nix::libc::sighandler_t);
         nix::libc::signal(nix::libc::SIGINT, signal_handler as *const () as nix::libc::sighandler_t);

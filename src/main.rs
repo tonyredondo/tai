@@ -197,25 +197,46 @@ extern "C" fn signal_handler(_sig: nix::libc::c_int) {
     SIGNAL_EXIT.store(true, Ordering::SeqCst);
 }
 
-fn set_app_icon() {
-    let icon_path = match std::env::current_dir() {
-        Ok(d) => d.join("assets/icon.png"),
-        Err(_) => return,
-    };
-    if !icon_path.exists() {
-        return;
+fn find_resource(name: &str) -> Option<std::path::PathBuf> {
+    // 1. Check relative to CWD (development: cargo run)
+    let cwd = std::env::current_dir().ok()?;
+    let p = cwd.join(name);
+    if p.exists() {
+        return Some(p);
     }
+    // 2. Check relative to the executable (inside .app bundle: Contents/MacOS/../Resources/)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(macos_dir) = exe.parent() {
+            let bundle_res = macos_dir.join("../Resources").join(name);
+            if bundle_res.exists() {
+                return Some(bundle_res);
+            }
+        }
+    }
+    None
+}
+
+fn set_app_icon() {
+    let icon_path = match find_resource("assets/icon.png")
+        .or_else(|| find_resource("icon.png"))
+    {
+        Some(p) => p,
+        None => return,
+    };
 
     // Set window icon via raylib (for non-macOS platforms)
     unsafe {
-        let mut icon = raylib::ffi::LoadImage(b"assets/icon.png\0".as_ptr() as *const _);
-        if !icon.data.is_null() {
-            raylib::ffi::ImageFormat(
-                &mut icon,
-                raylib::ffi::PixelFormat::PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 as i32,
-            );
-            raylib::ffi::SetWindowIcon(icon);
-            raylib::ffi::UnloadImage(icon);
+        let path_c = std::ffi::CString::new(icon_path.to_string_lossy().as_bytes()).ok();
+        if let Some(ref p) = path_c {
+            let mut icon = raylib::ffi::LoadImage(p.as_ptr());
+            if !icon.data.is_null() {
+                raylib::ffi::ImageFormat(
+                    &mut icon,
+                    raylib::ffi::PixelFormat::PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 as i32,
+                );
+                raylib::ffi::SetWindowIcon(icon);
+                raylib::ffi::UnloadImage(icon);
+            }
         }
     }
 

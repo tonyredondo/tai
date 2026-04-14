@@ -4,6 +4,47 @@ use nix::unistd::Pid;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
 
+#[cfg(target_os = "macos")]
+fn proc_cwd(pid: i32) -> Option<PathBuf> {
+    #[repr(C)]
+    struct VnodePathInfo {
+        _cdir_info: [u8; 152], // vnode_info_path.vip_vi (152 bytes)
+        cdir_path: [u8; 1024], // vnode_info_path.vip_path (MAXPATHLEN)
+        _rdir: [u8; 152 + 1024],
+    }
+
+    const PROC_PIDVNODEPATHINFO: i32 = 9;
+
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: i32,
+            flavor: i32,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffersize: i32,
+        ) -> i32;
+    }
+
+    let mut info: VnodePathInfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<VnodePathInfo>() as i32;
+    let ret = unsafe { proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &mut info as *mut _ as *mut _, size) };
+    if ret <= 0 {
+        return None;
+    }
+    let path = &info.cdir_path;
+    let len = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    if len == 0 {
+        return None;
+    }
+    let s = std::str::from_utf8(&path[..len]).ok()?;
+    Some(PathBuf::from(s))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn proc_cwd(pid: i32) -> Option<PathBuf> {
+    libproc::proc_pid::pidcwd(pid).ok()
+}
+
 pub struct Pty {
     master_fd: RawFd,
     child_pid: Pid,
@@ -63,14 +104,15 @@ impl Pty {
             }
 
             if pid == 0 {
-                if let Some(ref dir) = cwd {
-                    let c_path = std::ffi::CString::new(dir.to_string_lossy().as_ref())
-                        .unwrap_or_else(|_| std::ffi::CString::new("/").unwrap());
-                    if libc::chdir(c_path.as_ptr()) != 0 {
-                        let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-                        let c_home = std::ffi::CString::new(home.as_str()).unwrap();
-                        libc::chdir(c_home.as_ptr());
-                    }
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+                let target = cwd.as_ref()
+                    .map(|d| d.to_string_lossy().to_string())
+                    .unwrap_or_else(|| home.clone());
+                let c_path = std::ffi::CString::new(target.as_str())
+                    .unwrap_or_else(|_| std::ffi::CString::new("/").unwrap());
+                if libc::chdir(c_path.as_ptr()) != 0 {
+                    let c_home = std::ffi::CString::new(home.as_str()).unwrap();
+                    libc::chdir(c_home.as_ptr());
                 }
 
                 let shell = std::env::var("SHELL").unwrap_or_else(|_| {
@@ -198,8 +240,9 @@ impl Pty {
 
     pub fn get_cwd(&self) -> Option<PathBuf> {
         let pid = self.get_foreground_pid().unwrap_or(self.child_pid);
-        libproc::proc_pid::pidcwd(pid.as_raw()).ok()
-            .or_else(|| std::env::current_dir().ok())
+        proc_cwd(pid.as_raw())
+            .or_else(|| proc_cwd(self.child_pid.as_raw()))
+            .or_else(|| std::env::var("HOME").ok().map(PathBuf::from))
     }
 
     pub fn get_foreground_process_name(&self) -> Option<String> {

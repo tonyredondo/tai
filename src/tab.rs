@@ -248,6 +248,11 @@ impl TabSession {
         }
 
         self.term.drain_vt_mirror();
+
+        // Scrollback is now in the terminal buffer. Clear original_scrollback
+        // so auto-save captures the live buffer (including new user commands)
+        // instead of the stale pre-restore snapshot.
+        self.original_scrollback = None;
     }
 
     pub fn poll_ai(&mut self) {

@@ -197,6 +197,87 @@ extern "C" fn signal_handler(_sig: nix::libc::c_int) {
     SIGNAL_EXIT.store(true, Ordering::SeqCst);
 }
 
+fn set_app_icon() {
+    let icon_path = match std::env::current_dir() {
+        Ok(d) => d.join("assets/icon.png"),
+        Err(_) => return,
+    };
+    if !icon_path.exists() {
+        return;
+    }
+
+    // Set window icon via raylib (for non-macOS platforms)
+    unsafe {
+        let mut icon = raylib::ffi::LoadImage(b"assets/icon.png\0".as_ptr() as *const _);
+        if !icon.data.is_null() {
+            raylib::ffi::ImageFormat(
+                &mut icon,
+                raylib::ffi::PixelFormat::PIXELFORMAT_UNCOMPRESSED_R8G8B8A8 as i32,
+            );
+            raylib::ffi::SetWindowIcon(icon);
+            raylib::ffi::UnloadImage(icon);
+        }
+    }
+
+    // On macOS, SetWindowIcon doesn't affect the dock icon.
+    // Use NSApplication.setApplicationIconImage via the ObjC runtime.
+    #[cfg(target_os = "macos")]
+    unsafe {
+        type Id = *mut std::ffi::c_void;
+        type Sel = *mut std::ffi::c_void;
+        type MsgSend0 = unsafe extern "C" fn(Id, Sel) -> Id;
+        type MsgSend1 = unsafe extern "C" fn(Id, Sel, Id) -> Id;
+        type MsgSendStr = unsafe extern "C" fn(Id, Sel, *const i8) -> Id;
+
+        unsafe extern "C" {
+            fn objc_getClass(name: *const i8) -> Id;
+            fn sel_registerName(name: *const i8) -> Sel;
+            fn objc_msgSend();
+        }
+
+        let m0: MsgSend0 = std::mem::transmute(objc_msgSend as *const ());
+        let m1: MsgSend1 = std::mem::transmute(objc_msgSend as *const ());
+        let ms: MsgSendStr = std::mem::transmute(objc_msgSend as *const ());
+
+        let app = m0(
+            objc_getClass(c"NSApplication".as_ptr()),
+            sel_registerName(c"sharedApplication".as_ptr()),
+        );
+        if app.is_null() {
+            return;
+        }
+
+        let path_c = match std::ffi::CString::new(icon_path.to_string_lossy().as_bytes()) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let ns_path = ms(
+            objc_getClass(c"NSString".as_ptr()),
+            sel_registerName(c"stringWithUTF8String:".as_ptr()),
+            path_c.as_ptr(),
+        );
+
+        let image = m0(
+            objc_getClass(c"NSImage".as_ptr()),
+            sel_registerName(c"alloc".as_ptr()),
+        );
+        let image = m1(
+            image,
+            sel_registerName(c"initWithContentsOfFile:".as_ptr()),
+            ns_path,
+        );
+        if image.is_null() {
+            return;
+        }
+
+        m1(
+            app,
+            sel_registerName(c"setApplicationIconImage:".as_ptr()),
+            image,
+        );
+    }
+}
+
 fn main() {
     unsafe {
         nix::libc::signal(nix::libc::SIGTERM, signal_handler as *const () as nix::libc::sighandler_t);
@@ -323,6 +404,8 @@ fn main() {
     if saved_win_w > 0 && saved_win_h > 0 {
         unsafe { raylib::ffi::SetWindowPosition(saved_win_x, saved_win_y); }
     }
+
+    set_app_icon();
 
     rl.set_target_fps(60);
 

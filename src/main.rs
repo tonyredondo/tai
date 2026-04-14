@@ -305,7 +305,8 @@ fn inherit_shell_env() {
     }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
     let output = std::process::Command::new(&shell)
-        .args(["-l", "-c", "env"])
+        .args(["-i", "-l", "-c", "env"])
+        .stderr(std::process::Stdio::null())
         .output();
     if let Ok(out) = output {
         let text = String::from_utf8_lossy(&out.stdout);

@@ -19,7 +19,7 @@ pub struct Terminal {
     cell_height: i32,
     vt_mirror: Vec<u8>,
     effects_ctx: *mut EffectsContext,
-    pub last_osc_title: String,
+    pub last_osc_title: Box<String>,
 }
 
 pub enum PtyReadResult {
@@ -246,7 +246,7 @@ impl Terminal {
                 cell_height: 0,
                 vt_mirror: Vec::with_capacity(4096),
                 effects_ctx: ptr::null_mut(),
-                last_osc_title: String::new(),
+                last_osc_title: Box::new(String::new()),
             })
         }
     }
@@ -267,7 +267,7 @@ impl Terminal {
                 cell_height,
                 cols: self.cols,
                 rows: self.rows,
-                title_ptr: &mut self.last_osc_title as *mut String,
+                title_ptr: &mut *self.last_osc_title as *mut String,
             });
             let ctx_ptr = Box::into_raw(ctx);
             self.effects_ctx = ctx_ptr;

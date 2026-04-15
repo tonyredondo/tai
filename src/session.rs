@@ -2,6 +2,8 @@ use crate::config::TaiConfig;
 use crate::split::{panel_term_size, PanelRect, Panel, SplitDirection, SplitNode};
 use crate::tab::TabSession;
 use crate::tab_bar::TabBar;
+use crate::terminal::ssh::SshTabInfo;
+use crate::workspace::{Workspace, WorkspaceManager};
 
 use async_openai::types::{
     ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
@@ -21,11 +23,25 @@ const MAX_SCROLLBACK_LINES: usize = 5000;
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize)]
+pub struct SessionWorkspace {
+    pub name: String,
+    pub tree: SessionNode,
+    pub focused_panel_id: u32,
+    pub next_panel_id: u32,
+    #[serde(default)]
+    pub ssh_host: String,
+    #[serde(default)]
+    pub ssh_port: u16,
+    #[serde(default)]
+    pub ssh_user: String,
+    #[serde(default)]
+    pub ssh_password: String,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct SessionState {
     pub version: u32,
     pub font_size: i32,
-    pub focused_panel_id: u32,
-    pub next_panel_id: u32,
     #[serde(default)]
     pub window_width: i32,
     #[serde(default)]
@@ -34,8 +50,30 @@ pub struct SessionState {
     pub window_x: i32,
     #[serde(default)]
     pub window_y: i32,
-    pub tree: SessionNode,
+    #[serde(default)]
+    pub active_workspace: usize,
+    #[serde(default = "default_true")]
+    pub sidebar_visible: bool,
+    #[serde(default)]
+    pub workspaces: Vec<SessionWorkspace>,
+    // v1 compat fields (kept for deserialization, skipped on v2 serialize)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused_panel_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_panel_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<SessionNode>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ssh_host: String,
+    #[serde(default)]
+    pub ssh_port: u16,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ssh_user: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ssh_password: String,
 }
+
+fn default_true() -> bool { true }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -66,6 +104,14 @@ pub struct SessionTab {
     pub scroll_offset: u64,
     pub child_exited: bool,
     pub router: SessionRouter,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub ssh_host: String,
+    #[serde(default)]
+    pub ssh_port: u16,
+    #[serde(default)]
+    pub ssh_user: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -119,26 +165,47 @@ pub fn sessions_dir() -> Option<PathBuf> {
 // ---------------------------------------------------------------------------
 
 pub fn save(
-    root: &SplitNode,
-    focused_panel_id: u32,
-    next_panel_id: u32,
+    wm: &WorkspaceManager,
     font_size: i32,
     window_width: i32,
     window_height: i32,
     window_x: i32,
     window_y: i32,
 ) -> Result<(), String> {
-    let tree = split_node_to_session(root);
+    let workspaces: Vec<SessionWorkspace> = wm.workspaces.iter().map(|ws| {
+        let (ssh_host, ssh_port, ssh_user, ssh_password) = match &ws.ssh_info {
+            Some(info) => (info.host.clone(), info.port, info.user.clone(), ws.ssh_password.clone()),
+            None => (String::new(), 0, String::new(), String::new()),
+        };
+        SessionWorkspace {
+            name: ws.name.clone(),
+            tree: split_node_to_session(&ws.root),
+            focused_panel_id: ws.focused_panel_id,
+            next_panel_id: ws.next_panel_id,
+            ssh_host,
+            ssh_port,
+            ssh_user,
+            ssh_password,
+        }
+    }).collect();
+
     let state = SessionState {
         version: SESSION_VERSION,
         font_size,
-        focused_panel_id,
-        next_panel_id,
         window_width,
         window_height,
         window_x,
         window_y,
-        tree,
+        active_workspace: wm.active,
+        sidebar_visible: wm.sidebar_visible,
+        workspaces,
+        focused_panel_id: None,
+        next_panel_id: None,
+        tree: None,
+        ssh_host: String::new(),
+        ssh_port: 0,
+        ssh_user: String::new(),
+        ssh_password: String::new(),
     };
 
     let json = serde_json::to_string(&state).map_err(|e| format!("serialize: {e}"))?;
@@ -269,7 +336,7 @@ fn tab_to_session(tab: &TabSession) -> SessionTab {
     let cwd = if tab.child_exited {
         String::new()
     } else {
-        tab.pty
+        tab.backend
             .get_cwd()
             .map(|p| p.display().to_string())
             .unwrap_or_default()
@@ -314,9 +381,15 @@ fn tab_to_session(tab: &TabSession) -> SessionTab {
         .filter_map(msg_to_session)
         .collect();
 
+    let (kind, ssh_host, ssh_port, ssh_user) = if let Some(ref info) = tab.ssh_info {
+        ("ssh".to_string(), info.host.clone(), info.port, info.user.clone())
+    } else {
+        (String::new(), String::new(), 0, String::new())
+    };
+
     SessionTab {
         cwd,
-        title: tab.term.last_osc_title.clone(),
+        title: (*tab.term.last_osc_title).clone(),
         scrollback,
         scroll_offset,
         child_exited: tab.child_exited,
@@ -326,6 +399,10 @@ fn tab_to_session(tab: &TabSession) -> SessionTab {
             auto_execute: tab.router.auto_execute(),
             conversation,
         },
+        kind,
+        ssh_host,
+        ssh_port,
+        ssh_user,
     }
 }
 
@@ -433,36 +510,90 @@ pub fn restore(
     scr_w: i32,
     scr_h: i32,
     status_bar_height: i32,
+    sidebar_w: i32,
     pad: i32,
     minimap_width: i32,
     cw: i32,
     ch: i32,
-) -> Result<(SplitNode, u32, u32, i32), String> {
+) -> Result<(WorkspaceManager, i32), String> {
+    // Normalize: if v1 format (no workspaces vec), migrate single tree to one workspace
+    let session_workspaces = if state.workspaces.is_empty() {
+        if let Some(tree) = state.tree {
+            vec![SessionWorkspace {
+                name: "default".to_string(),
+                tree,
+                focused_panel_id: state.focused_panel_id.unwrap_or(0),
+                next_panel_id: state.next_panel_id.unwrap_or(1),
+                ssh_host: state.ssh_host,
+                ssh_port: state.ssh_port,
+                ssh_user: state.ssh_user,
+                ssh_password: state.ssh_password,
+            }]
+        } else {
+            return Err("No workspace data found".into());
+        }
+    } else {
+        state.workspaces
+    };
+
+    let mut workspaces: Vec<Workspace> = Vec::new();
+
+    for sw in &session_workspaces {
+        match restore_single_workspace(sw, config, scr_w, scr_h, status_bar_height, sidebar_w, pad, minimap_width, cw, ch) {
+            Ok(ws) => workspaces.push(ws),
+            Err(e) => eprintln!("[TAI] Failed to restore workspace '{}': {e}", sw.name),
+        }
+    }
+
+    if workspaces.is_empty() {
+        return Err("All workspaces failed to restore".into());
+    }
+
+    let next_id = workspaces.len() as u32 + 1;
+    let wm = WorkspaceManager::from_restored(
+        workspaces,
+        state.active_workspace,
+        state.sidebar_visible,
+        next_id,
+    );
+
+    Ok((wm, state.font_size))
+}
+
+fn restore_single_workspace(
+    sw: &SessionWorkspace,
+    config: &TaiConfig,
+    scr_w: i32,
+    scr_h: i32,
+    status_bar_height: i32,
+    sidebar_w: i32,
+    pad: i32,
+    minimap_width: i32,
+    cw: i32,
+    ch: i32,
+) -> Result<Workspace, String> {
     let initial_rect = PanelRect {
-        x: 0,
+        x: sidebar_w,
         y: 0,
-        w: scr_w,
+        w: scr_w - sidebar_w,
         h: scr_h - status_bar_height,
     };
 
-    // Pass 1: build skeleton (empty panels, no terminals)
-    let mut skeleton = build_skeleton(&state.tree, ch);
+    let mut skeleton = build_skeleton(&sw.tree, ch);
     skeleton.layout(initial_rect);
 
-    // Collect panel rects and saved tab data
     let mut panel_data: Vec<(u32, PanelRect, i32, Vec<SessionTab>, usize)> = Vec::new();
     skeleton.for_each_panel(&mut |panel| {
         panel_data.push((
             panel.id,
             panel.rect,
             panel.tab_bar.height,
-            Vec::new(), // placeholder, filled below
+            Vec::new(),
             0,
         ));
     });
 
-    // Map saved tab data to panels by id
-    let saved_panels = collect_session_panels(&state.tree);
+    let saved_panels = collect_session_panels(&sw.tree);
     for pd in &mut panel_data {
         if let Some(sp) = saved_panels.iter().find(|sp| sp.id == pd.0) {
             pd.3 = sp.tabs.clone();
@@ -470,7 +601,6 @@ pub fn restore(
         }
     }
 
-    // Pass 2: populate tabs for each panel
     for pd in &panel_data {
         let (panel_id, rect, tab_bar_h, saved_tabs, saved_active) = (pd.0, pd.1, pd.2, &pd.3, pd.4);
         let (cols, rows) = panel_term_size(&rect, pad, minimap_width, tab_bar_h, cw, ch);
@@ -483,7 +613,6 @@ pub fn restore(
             }
         }
 
-        // Empty panels guard
         if live_tabs.is_empty() {
             match TabSession::new(config, cols, rows, cw, ch) {
                 Ok(tab) => live_tabs.push(tab),
@@ -502,13 +631,30 @@ pub fn restore(
         }
     }
 
-    let mut focused = state.focused_panel_id;
+    let mut focused = sw.focused_panel_id;
     if skeleton.panel_by_id(focused).is_none() {
         let leaves = skeleton.collect_leaves();
         focused = leaves.first().copied().unwrap_or(0);
     }
 
-    Ok((skeleton, focused, state.next_panel_id, state.font_size))
+    let ssh_info = if !sw.ssh_host.is_empty() && !sw.ssh_user.is_empty() {
+        Some(SshTabInfo {
+            host: sw.ssh_host.clone(),
+            port: sw.ssh_port,
+            user: sw.ssh_user.clone(),
+        })
+    } else {
+        None
+    };
+
+    Ok(Workspace {
+        name: sw.name.clone(),
+        root: skeleton,
+        focused_panel_id: focused,
+        next_panel_id: sw.next_panel_id,
+        ssh_info,
+        ssh_password: sw.ssh_password.clone(),
+    })
 }
 
 fn build_skeleton(node: &SessionNode, ch: i32) -> SplitNode {
@@ -563,6 +709,17 @@ fn restore_tab(
     cw: i32,
     ch: i32,
 ) -> Result<TabSession, String> {
+    if st.kind == "ssh" {
+        let title = format!("{}@{}:{} (disconnected)", st.ssh_user, st.ssh_host, st.ssh_port);
+        let mut tab = TabSession::new_dead(config, &title, &st.scrollback, st.scroll_offset, cols, rows, cw, ch, &st.router)?;
+        tab.ssh_info = Some(crate::terminal::ssh::SshTabInfo {
+            host: st.ssh_host.clone(),
+            port: st.ssh_port,
+            user: st.ssh_user.clone(),
+        });
+        return Ok(tab);
+    }
+
     if st.child_exited {
         return TabSession::new_dead(config, &st.title, &st.scrollback, st.scroll_offset, cols, rows, cw, ch, &st.router);
     }
@@ -583,8 +740,6 @@ fn restore_tab(
                 &st.scrollback, st.scroll_offset, &st.router,
             )
             .or_else(|_| {
-                // Last resort: plain spawn (skip scrollback -- setup_effects already
-                // wired so vt_write could send responses to the live shell)
                 let mut tab = TabSession::new(config, cols, rows, cw, ch)?;
                 let messages = session_messages_to_api(&st.router.conversation);
                 tab.router.restore_history(

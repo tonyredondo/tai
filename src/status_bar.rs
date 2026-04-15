@@ -20,6 +20,7 @@ impl StatusBar {
         screen_w: i32,
         screen_h: i32,
         font_size: i32,
+        sidebar_w: i32,
         mode: InputMode,
         cwd: &str,
         _ai_input: &str,
@@ -49,7 +50,7 @@ impl StatusBar {
             ),
         };
 
-        d.draw_rectangle(0, bar_y, screen_w, bar_h, bg_color);
+        d.draw_rectangle(sidebar_w, bar_y, screen_w - sidebar_w, bar_h, bg_color);
 
         let tab_prefix = match panel_info {
             Some((panel_idx, panel_count, tab_idx, tab_count)) => {
@@ -96,7 +97,7 @@ impl StatusBar {
                 *font,
                 c_text.as_ptr(),
                 raylib::ffi::Vector2 {
-                    x: 0.0,
+                    x: sidebar_w as f32,
                     y: bar_y as f32 + 4.0,
                 },
                 font_size as f32,
@@ -112,7 +113,7 @@ impl StatusBar {
 
         if mode == InputMode::AiPrompt {
             let accent_y = bar_y;
-            d.draw_rectangle(0, accent_y, screen_w, 2, Color::new(80, 160, 255, 255));
+            d.draw_rectangle(sidebar_w, accent_y, screen_w - sidebar_w, 2, Color::new(80, 160, 255, 255));
         }
     }
 }

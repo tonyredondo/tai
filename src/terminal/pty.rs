@@ -185,7 +185,7 @@ impl Pty {
     }
 
     pub fn read_nonblocking(
-        &self,
+        &mut self,
         terminal: &mut Terminal,
         mut capture: Option<&mut Vec<u8>>,
         mut mirror: Option<&mut Vec<u8>>,
@@ -222,11 +222,11 @@ impl Pty {
         }
     }
 
-    pub fn write(&self, data: &[u8]) {
+    pub fn write(&mut self, data: &[u8]) {
         pty_write_raw(self.master_fd, data);
     }
 
-    pub fn resize(&self, cols: u16, rows: u16, cw: i32, ch: i32) {
+    pub fn resize(&mut self, cols: u16, rows: u16, cw: i32, ch: i32) {
         let ws = libc::winsize {
             ws_row: rows,
             ws_col: cols,
@@ -265,7 +265,7 @@ impl Pty {
         }
     }
 
-    pub fn set_echo(&self, enable: bool) {
+    pub fn set_echo(&mut self, enable: bool) {
         unsafe {
             let mut attrs: libc::termios = std::mem::zeroed();
             if libc::tcgetattr(self.master_fd, &mut attrs) == 0 {

@@ -1,6 +1,6 @@
 use crate::bindings::*;
 use crate::terminal::engine::Terminal;
-use crate::terminal::pty::Pty;
+use crate::terminal::backend::Backend;
 use raylib::prelude::*;
 
 fn raylib_key_to_ghostty(rl_key: KeyboardKey) -> u32 {
@@ -109,7 +109,7 @@ fn raylib_mouse_to_ghostty(btn: MouseButton) -> u32 {
     }
 }
 
-pub fn handle_input(rl: &RaylibHandle, terminal: &mut Terminal, pty: &Pty) -> Vec<char> {
+pub fn handle_input(rl: &RaylibHandle, terminal: &mut Terminal, backend: &mut Backend) -> Vec<char> {
     unsafe {
         ghostty_key_encoder_setopt_from_terminal(terminal.key_encoder(), terminal.handle());
     }
@@ -235,14 +235,14 @@ pub fn handle_input(rl: &RaylibHandle, terminal: &mut Terminal, pty: &Pty) -> Ve
                 &mut written,
             );
             if res == GhosttyResult_GHOSTTY_SUCCESS && written > 0 {
-                pty.write(&buf[..written]);
+                backend.write(&buf[..written]);
                 char_utf8.clear();
             }
         }
     }
 
     if !char_utf8.is_empty() {
-        pty.write(&char_utf8);
+        backend.write(&char_utf8);
     }
 
     typed_chars
@@ -251,7 +251,7 @@ pub fn handle_input(rl: &RaylibHandle, terminal: &mut Terminal, pty: &Pty) -> Ve
 pub fn handle_mouse(
     rl: &RaylibHandle,
     terminal: &mut Terminal,
-    pty: &Pty,
+    backend: &mut Backend,
     cell_width: i32,
     cell_height: i32,
     pad_x: i32,
@@ -330,14 +330,14 @@ pub fn handle_mouse(
                     GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_PRESS,
                 );
                 ghostty_mouse_event_set_button(terminal.mouse_event(), gbtn);
-                mouse_encode_and_write(pty, terminal);
+                mouse_encode_and_write(backend, terminal);
             } else if rl.is_mouse_button_released(btn) {
                 ghostty_mouse_event_set_action(
                     terminal.mouse_event(),
                     GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_RELEASE,
                 );
                 ghostty_mouse_event_set_button(terminal.mouse_event(), gbtn);
-                mouse_encode_and_write(pty, terminal);
+                mouse_encode_and_write(backend, terminal);
             }
         }
 
@@ -365,7 +365,7 @@ pub fn handle_mouse(
             } else {
                 ghostty_mouse_event_clear_button(terminal.mouse_event());
             }
-            mouse_encode_and_write(pty, terminal);
+            mouse_encode_and_write(backend, terminal);
         }
 
         let wheel = rl.get_mouse_wheel_move();
@@ -388,12 +388,12 @@ pub fn handle_mouse(
                     terminal.mouse_event(),
                     GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_PRESS,
                 );
-                mouse_encode_and_write(pty, terminal);
+                mouse_encode_and_write(backend, terminal);
                 ghostty_mouse_event_set_action(
                     terminal.mouse_event(),
                     GhosttyMouseAction_GHOSTTY_MOUSE_ACTION_RELEASE,
                 );
-                mouse_encode_and_write(pty, terminal);
+                mouse_encode_and_write(backend, terminal);
             } else {
                 let delta = if wheel > 0.0 { -3 } else { 3 };
                 terminal.scroll_viewport(delta);
@@ -402,7 +402,7 @@ pub fn handle_mouse(
     }
 }
 
-fn mouse_encode_and_write(pty: &Pty, terminal: &Terminal) {
+fn mouse_encode_and_write(backend: &mut Backend, terminal: &Terminal) {
     unsafe {
         let mut buf = [0u8; 128];
         let mut written: usize = 0;
@@ -414,7 +414,7 @@ fn mouse_encode_and_write(pty: &Pty, terminal: &Terminal) {
             &mut written,
         );
         if res == GhosttyResult_GHOSTTY_SUCCESS && written > 0 {
-            pty.write(&buf[..written]);
+            backend.write(&buf[..written]);
         }
     }
 }

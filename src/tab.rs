@@ -5,19 +5,22 @@ use crate::overlay::CommandOverlay;
 use crate::router::InputRouter;
 use crate::selection::TextSelection;
 use crate::session::{SessionRouter, session_messages_to_api};
+use crate::terminal::backend::Backend;
 use crate::terminal::engine::{PtyReadResult, Terminal};
 use crate::terminal::pty::Pty;
+use crate::terminal::ssh::{SshBackend, SshTabInfo};
 use std::path::PathBuf;
 
 pub struct TabSession {
     pub term: Terminal,
-    pub pty: Pty,
+    pub backend: Backend,
     pub minimap: Minimap,
     pub router: InputRouter,
     pub selection: TextSelection,
     pub overlay: CommandOverlay,
     pub pty_mirror: Vec<u8>,
     pub child_exited: bool,
+    pub ssh_info: Option<SshTabInfo>,
     pending_scrollback: Option<Vec<String>>,
     prompt_ready_time: Option<std::time::Instant>,
     /// Raw bytes of the last complete prompt render (PROMPT_SP + prompt),
@@ -40,13 +43,14 @@ impl TabSession {
 
         Ok(TabSession {
             term,
-            pty,
+            backend: Backend::Local(pty),
             minimap: Minimap::new(cols),
             router,
             selection: TextSelection::new(),
             overlay: CommandOverlay::new(),
             pty_mirror: Vec::with_capacity(8192),
             child_exited: false,
+            ssh_info: None,
             pending_scrollback: None,
             prompt_ready_time: None,
             last_prompt_bytes: Vec::new(),
@@ -94,13 +98,14 @@ impl TabSession {
 
         Ok(TabSession {
             term,
-            pty,
+            backend: Backend::Local(pty),
             minimap: Minimap::new(cols),
             router,
             selection: TextSelection::new(),
             overlay: CommandOverlay::new(),
             pty_mirror: Vec::with_capacity(8192),
             child_exited: false,
+            ssh_info: None,
             pending_scrollback: pending,
             prompt_ready_time: None,
             last_prompt_bytes: Vec::new(),
@@ -123,7 +128,6 @@ impl TabSession {
         let pty = Pty::null();
         term.resize(cols, rows, cw as u32, ch as u32);
 
-        // Feed scrollback with null pty (safe, setup_effects not called yet)
         if !scrollback.is_empty() {
             for line in scrollback.lines() {
                 let mut buf = line.as_bytes().to_vec();
@@ -133,10 +137,8 @@ impl TabSession {
             term.drain_vt_mirror();
         }
 
-        // Wire effects with -1 fd (harmless)
         term.setup_effects(pty.master_fd(), cw, ch);
 
-        // Restore scroll position
         if let Some((total, _offset, len)) = term.get_scrollbar() {
             let current_bottom = total.saturating_sub(len) as i64;
             let delta = scroll_offset as i64 - current_bottom;
@@ -145,7 +147,7 @@ impl TabSession {
             }
         }
 
-        term.last_osc_title = title.to_string();
+        *term.last_osc_title = title.to_string();
 
         let ai_bridge = config.api_key().map(|key| AiBridge::new(&config.ai, &key));
         let mut router = InputRouter::new(config, ai_bridge);
@@ -163,13 +165,48 @@ impl TabSession {
 
         Ok(TabSession {
             term,
-            pty,
+            backend: Backend::Local(pty),
             minimap,
             router,
             selection: TextSelection::new(),
             overlay: CommandOverlay::new(),
             pty_mirror: Vec::with_capacity(8192),
             child_exited: true,
+            ssh_info: None,
+            pending_scrollback: None,
+            prompt_ready_time: None,
+            last_prompt_bytes: Vec::new(),
+            original_scrollback: None,
+        })
+    }
+
+    pub fn new_ssh(
+        config: &TaiConfig,
+        ssh_backend: SshBackend,
+        cols: u16,
+        rows: u16,
+        cw: i32,
+        ch: i32,
+    ) -> Result<Self, String> {
+        let mut term = Terminal::new(cols, rows, config.terminal.scrollback)?;
+        term.resize(cols, rows, cw as u32, ch as u32);
+
+        let ssh_info = Some(ssh_backend.info.clone());
+        term.setup_effects(ssh_backend.proxy_fd(), cw, ch);
+
+        let ai_bridge = config.api_key().map(|key| AiBridge::new(&config.ai, &key));
+        let router = InputRouter::new(config, ai_bridge);
+
+        Ok(TabSession {
+            term,
+            backend: Backend::Ssh(ssh_backend),
+            minimap: Minimap::new(cols),
+            router,
+            selection: TextSelection::new(),
+            overlay: CommandOverlay::new(),
+            pty_mirror: Vec::with_capacity(8192),
+            child_exited: false,
+            ssh_info,
             pending_scrollback: None,
             prompt_ready_time: None,
             last_prompt_bytes: Vec::new(),
@@ -183,7 +220,7 @@ impl TabSession {
         }
         let before = self.pty_mirror.len();
         let capture = self.router.capture_buffer();
-        match self.pty.read_nonblocking(&mut self.term, capture, Some(&mut self.pty_mirror)) {
+        match self.backend.read_nonblocking(&mut self.term, capture, Some(&mut self.pty_mirror)) {
             PtyReadResult::Ok => {}
             PtyReadResult::Eof | PtyReadResult::Error => {
                 self.child_exited = true;
@@ -194,9 +231,6 @@ impl TabSession {
             let new_data = &self.pty_mirror[before..];
             if !new_data.is_empty() {
                 if new_data.windows(8).any(|w| w == b"\x1b[?2004h") {
-                    // Save the complete prompt render (everything from the
-                    // last PROMPT_SP through the end). Each new prompt_ready
-                    // replaces the previous capture — we want the LAST one.
                     self.last_prompt_bytes = self.pty_mirror[before..].to_vec();
                     self.prompt_ready_time = Some(std::time::Instant::now());
                 } else {
@@ -225,14 +259,8 @@ impl TabSession {
             _ => return,
         };
 
-        // Strategy: clear the visible screen (which may have a stale double
-        // prompt from the shell's async re-render), write scrollback, then
-        // replay the last captured prompt render to get a single clean prompt.
-
-        // 1. Move to home and erase the entire visible area
         self.term.vt_write(b"\x1b[H\x1b[J");
 
-        // 2. Write the scrollback content
         for line in &lines {
             let mut buf = line.as_bytes().to_vec();
             buf.extend_from_slice(b"\r\n");
@@ -240,8 +268,6 @@ impl TabSession {
         }
         self.term.vt_write(b"\x1b[0m");
 
-        // 3. Replay the last captured prompt render (PROMPT_SP + prompt).
-        //    This draws exactly ONE prompt below the scrollback.
         if !self.last_prompt_bytes.is_empty() {
             let prompt = self.last_prompt_bytes.clone();
             self.term.vt_write(&prompt);
@@ -249,14 +275,11 @@ impl TabSession {
 
         self.term.drain_vt_mirror();
 
-        // Scrollback is now in the terminal buffer. Clear original_scrollback
-        // so auto-save captures the live buffer (including new user commands)
-        // instead of the stale pre-restore snapshot.
         self.original_scrollback = None;
     }
 
     pub fn poll_ai(&mut self) {
-        self.router.poll_ai_responses(&mut self.term, &self.pty, &mut self.overlay);
+        self.router.poll_ai_responses(&mut self.term, &mut self.backend, &mut self.overlay);
         if let Some(vt_data) = self.term.drain_vt_mirror() {
             self.minimap.feed(&vt_data);
         }
@@ -264,20 +287,35 @@ impl TabSession {
 
     pub fn resize(&mut self, cols: u16, rows: u16, cw: u32, ch: u32) {
         self.term.resize(cols, rows, cw, ch);
-        self.pty.resize(cols, rows, cw as i32, ch as i32);
+        self.backend.resize(cols, rows, cw as i32, ch as i32);
         self.minimap.set_cols(cols);
         let buffer_text = self.term.get_buffer_text(0);
         self.minimap.rebuild_from_text(&buffer_text);
     }
 
+    pub fn revive_ssh(&mut self, ssh_backend: SshBackend, cw: i32, ch: i32) {
+        let info = ssh_backend.info.clone();
+        self.term.setup_effects(ssh_backend.proxy_fd(), cw, ch);
+        self.backend = Backend::Ssh(ssh_backend);
+        self.ssh_info = Some(info);
+        self.child_exited = false;
+        let title = &*self.term.last_osc_title;
+        if title.ends_with("(disconnected)") {
+            *self.term.last_osc_title = String::new();
+        }
+    }
+
     pub fn title(&self) -> String {
         if !self.term.last_osc_title.is_empty() {
-            return self.term.last_osc_title.clone();
+            return (*self.term.last_osc_title).clone();
         }
-        match self.pty.get_foreground_process_name() {
+        if let Some(ref info) = self.ssh_info {
+            return format!("{}@{}", info.user, info.host);
+        }
+        match self.backend.get_foreground_process_name() {
             Some(name) => name,
             None => {
-                self.pty.get_cwd()
+                self.backend.get_cwd()
                     .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
                     .unwrap_or_else(|| "shell".to_string())
             }

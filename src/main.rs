@@ -16,6 +16,7 @@ mod status_bar;
 mod tab;
 mod tab_bar;
 mod terminal;
+mod workspace;
 
 use config::TaiConfig;
 use router::InputMode;
@@ -24,6 +25,7 @@ use split::{SplitDirection, SplitNode, PanelRect, alloc_panel_id, create_panel, 
 use status_bar::StatusBar;
 use tab::TabSession;
 use tab_bar::TabBarAction;
+use workspace::{Workspace, WorkspaceManager, SIDEBAR_WIDTH, ROW_HEIGHT, SIDEBAR_BUTTON_HEIGHT};
 use raylib::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -150,12 +152,13 @@ fn relayout_and_resize(
     scr_w: i32,
     scr_h: i32,
     status_bar_height: i32,
+    sidebar_w: i32,
     pad: i32,
     minimap_width: i32,
     cell_width: i32,
     cell_height: i32,
 ) {
-    root.layout(PanelRect { x: 0, y: 0, w: scr_w, h: scr_h - status_bar_height });
+    root.layout(PanelRect { x: sidebar_w, y: 0, w: scr_w - sidebar_w, h: scr_h - status_bar_height });
     root.for_each_panel_mut(&mut |panel| {
         let (cols, rows) = panel_term_size(&panel.rect, pad, minimap_width, panel.tab_bar.height, cell_width, cell_height);
         for tab in &mut panel.tabs {
@@ -169,6 +172,7 @@ fn create_fresh_panel(
     scr_w: i32,
     scr_h: i32,
     status_bar_height: i32,
+    sidebar_w: i32,
     pad: i32,
     minimap_width: i32,
     cell_width: i32,
@@ -176,7 +180,7 @@ fn create_fresh_panel(
 ) -> (SplitNode, u32, u32) {
     let mut next_panel_id: u32 = 0;
     let initial_id = alloc_panel_id(&mut next_panel_id);
-    let initial_rect = PanelRect { x: 0, y: 0, w: scr_w, h: scr_h - status_bar_height };
+    let initial_rect = PanelRect { x: sidebar_w, y: 0, w: scr_w - sidebar_w, h: scr_h - status_bar_height };
     let tab_bar_height = cell_height + 14;
     let (term_cols, term_rows) = panel_term_size(&initial_rect, pad, minimap_width, tab_bar_height, cell_width, cell_height);
 
@@ -433,8 +437,8 @@ fn main() {
         .map(|s| (s.window_width, s.window_height, s.window_x, s.window_y))
         .unwrap_or((0, 0, 0, 0));
 
-    let init_w = if saved_win_w > 0 { saved_win_w } else { 800 };
-    let init_h = if saved_win_h > 0 { saved_win_h } else { 600 };
+    let init_w = if saved_win_w > 0 { saved_win_w } else { 1200 };
+    let init_h = if saved_win_h > 0 { saved_win_h } else { 750 };
 
     unsafe {
         raylib::ffi::SetConfigFlags(
@@ -478,25 +482,35 @@ fn main() {
     let status_bar = StatusBar::new(&config.ai.model, ai_available);
 
     // --- Restore session or create fresh ---
-    let (mut root, mut focused_panel_id, mut next_panel_id) = if let Some(state) = loaded_session {
+    let mut wm = if let Some(state) = loaded_session {
+        let initial_sidebar_w = if state.sidebar_visible { SIDEBAR_WIDTH } else { 0 };
         match session::restore(
             state,
             &config,
             scr_w, scr_h,
             status_bar_height,
+            initial_sidebar_w,
             pad, minimap_width,
             cell_width, cell_height,
         ) {
-            Ok((tree, focused, next_id, _restored_font_size)) => {
-                (tree, focused, next_id)
-            }
+            Ok((restored_wm, _restored_font_size)) => restored_wm,
             Err(e) => {
                 eprintln!("[TAI] Session restore failed, starting fresh: {e}");
-                create_fresh_panel(&config, scr_w, scr_h, status_bar_height, pad, minimap_width, cell_width, cell_height)
+                let (root, fid, nid) = create_fresh_panel(&config, scr_w, scr_h, status_bar_height, 0, pad, minimap_width, cell_width, cell_height);
+                WorkspaceManager::new(Workspace {
+                    name: "default".to_string(), root,
+                    focused_panel_id: fid, next_panel_id: nid,
+                    ssh_info: None, ssh_password: String::new(),
+                })
             }
         }
     } else {
-        create_fresh_panel(&config, scr_w, scr_h, status_bar_height, pad, minimap_width, cell_width, cell_height)
+        let (root, fid, nid) = create_fresh_panel(&config, scr_w, scr_h, status_bar_height, 0, pad, minimap_width, cell_width, cell_height);
+        WorkspaceManager::new(Workspace {
+            name: "default".to_string(), root,
+            focused_panel_id: fid, next_panel_id: nid,
+            ssh_info: None, ssh_password: String::new(),
+        })
     };
 
     let mut prev_width = scr_w;
@@ -508,6 +522,7 @@ fn main() {
 
     let mut app_exit = false;
     let mut show_help = false;
+    let mut help_scroll: i32 = 0;
     let mut show_session_mgr = false;
     let mut sm_names: Vec<String> = Vec::new();
     let mut sm_selected: usize = 0;
@@ -516,11 +531,49 @@ fn main() {
     let mut sm_status: Option<(String, Instant)> = None;
     let mut last_autosave = Instant::now();
 
+    let mut sidebar_last_click: Option<(usize, Instant)> = None;
+
+    let mut show_ssh_connect = false;
+    let mut ssh_host = String::new();
+    let mut ssh_port = String::from("22");
+    let mut ssh_user = String::new();
+    let mut ssh_password = String::new();
+    let mut ssh_focus: usize = 0; // 0=host, 1=port, 2=user, 3=password
+    let mut ssh_error: Option<String> = None;
+    let mut ssh_manager = crate::terminal::ssh::SshConnectionManager::new();
+
+    // Reconnect SSH for all workspaces that have SSH info
+    for ws_idx in 0..wm.workspaces.len() {
+        let ssh_info = wm.workspaces[ws_idx].ssh_info.clone();
+        let ssh_password = wm.workspaces[ws_idx].ssh_password.clone();
+        if let Some(ref info) = ssh_info {
+            match ssh_manager.get_or_connect(&info.host, info.port, &info.user, &ssh_password) {
+                Ok(session) => {
+                    wm.workspaces[ws_idx].root.for_each_panel_mut(&mut |panel| {
+                        for tab in &mut panel.tabs {
+                            if tab.ssh_info.is_some() && tab.child_exited {
+                                let (cols, rows) = panel_term_size(
+                                    &panel.rect, pad, minimap_width, panel.tab_bar.height, cell_width, cell_height,
+                                );
+                                if let Ok(ssh_backend) = ssh_manager.open_channel(&session, cols, rows, info.clone()) {
+                                    tab.revive_ssh(ssh_backend, cell_width, cell_height);
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("[TAI] Failed to reconnect SSH for workspace '{}': {e}", info.host);
+                }
+            }
+        }
+    }
+
     while !rl.window_should_close() && !app_exit && !SIGNAL_EXIT.load(Ordering::Relaxed) {
         if last_autosave.elapsed().as_secs() >= 5 {
             let win_pos = unsafe { raylib::ffi::GetWindowPosition() };
             if let Err(e) = session::save(
-                &root, focused_panel_id, next_panel_id, font_size,
+                &wm, font_size,
                 rl.get_screen_width(), rl.get_screen_height(),
                 win_pos.x as i32, win_pos.y as i32,
             ) {
@@ -533,26 +586,36 @@ fn main() {
             let w = rl.get_screen_width();
             let h = rl.get_screen_height();
             if w != prev_width || h != prev_height {
-                relayout_and_resize(&mut root, w, h, status_bar_height, pad, minimap_width, cell_width, cell_height);
+                let sidebar_w = wm.sidebar_width();
+                relayout_and_resize(&mut wm.active_mut().root, w, h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
                 prev_width = w;
                 prev_height = h;
             }
         }
 
-        // Read PTY and poll AI for ALL panels/tabs
-        root.for_each_panel_mut(&mut |panel| {
-            for tab in &mut panel.tabs {
-                tab.read_pty();
-                tab.poll_ai();
-            }
-        });
+        // Read PTY and poll AI for ALL workspaces/panels/tabs
+        for ws in &mut wm.workspaces {
+            ws.root.for_each_panel_mut(&mut |panel| {
+                for tab in &mut panel.tabs {
+                    tab.read_pty();
+                    tab.poll_ai();
+                }
+            });
+        }
 
         // Update window title from focused panel's active tab
         title_frame += 1;
         if title_frame % 30 == 0 {
-            if let Some(panel) = root.panel_by_id(focused_panel_id) {
+            let ws = wm.active();
+            if let Some(panel) = ws.root.panel_by_id(ws.focused_panel_id) {
                 let tab_title = panel.active_tab().title();
-                let new_title = if tab_title == "shell" {
+                let new_title = if wm.workspaces.len() > 1 {
+                    if tab_title == "shell" {
+                        format!("Terminal AI - [{}]", ws.name)
+                    } else {
+                        format!("Terminal AI - [{}] {}", ws.name, tab_title)
+                    }
+                } else if tab_title == "shell" {
                     "Terminal AI".to_string()
                 } else {
                     format!("Terminal AI - {}", tab_title)
@@ -580,6 +643,7 @@ fn main() {
             show_help = !show_help;
             if show_help {
                 show_session_mgr = false;
+                help_scroll = 0;
             }
         } else if show_help && rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
             show_help = false;
@@ -588,6 +652,10 @@ fn main() {
         if show_help {
             loop {
                 if unsafe { raylib::ffi::GetCharPressed() } == 0 { break; }
+            }
+            let wheel = unsafe { raylib::ffi::GetMouseWheelMove() } as i32;
+            if wheel != 0 {
+                help_scroll = (help_scroll - wheel * 24).max(0);
             }
         }
 
@@ -634,7 +702,7 @@ fn main() {
                     if !name.is_empty() {
                         let win_pos = unsafe { raylib::ffi::GetWindowPosition() };
                         match session::save(
-                            &root, focused_panel_id, next_panel_id, font_size,
+                            &wm, font_size,
                             rl.get_screen_width(), rl.get_screen_height(),
                             win_pos.x as i32, win_pos.y as i32,
                         ) {
@@ -713,7 +781,7 @@ fn main() {
                     // Load selected session (in-app)
                     let win_pos = unsafe { raylib::ffi::GetWindowPosition() };
                     let _ = session::save(
-                        &root, focused_panel_id, next_panel_id, font_size,
+                        &wm, font_size,
                         rl.get_screen_width(), rl.get_screen_height(),
                         win_pos.x as i32, win_pos.y as i32,
                     );
@@ -738,19 +806,43 @@ fn main() {
                                 status_bar_height = font_size + 8;
                             }
 
+                            let load_sidebar_w = if state.sidebar_visible { SIDEBAR_WIDTH } else { 0 };
+
                             let scr_w = rl.get_screen_width();
                             let scr_h = rl.get_screen_height();
                             match session::restore(
                                 state, &config, scr_w, scr_h,
-                                status_bar_height, pad, minimap_width, cell_width, cell_height,
+                                status_bar_height, load_sidebar_w, pad, minimap_width, cell_width, cell_height,
                             ) {
-                                Ok((new_root, focused, next_id, _)) => {
+                                Ok((new_wm, _)) => {
                                     if font_changed {
                                         unsafe { raylib::ffi::UnloadFont(old_mono_font); }
                                     }
-                                    root = new_root;
-                                    focused_panel_id = focused;
-                                    next_panel_id = next_id;
+                                    ssh_manager.clear();
+                                    wm = new_wm;
+
+                                    // Reconnect SSH for all workspaces
+                                    for ws_idx in 0..wm.workspaces.len() {
+                                        let ssh_info = wm.workspaces[ws_idx].ssh_info.clone();
+                                        let ssh_password = wm.workspaces[ws_idx].ssh_password.clone();
+                                        if let Some(ref info) = ssh_info {
+                                            if let Ok(sess) = ssh_manager.get_or_connect(&info.host, info.port, &info.user, &ssh_password) {
+                                                wm.workspaces[ws_idx].root.for_each_panel_mut(&mut |panel| {
+                                                    for tab in &mut panel.tabs {
+                                                        if tab.ssh_info.is_some() && tab.child_exited {
+                                                            let (cols, rows) = panel_term_size(
+                                                                &panel.rect, pad, minimap_width, panel.tab_bar.height, cell_width, cell_height,
+                                                            );
+                                                            if let Ok(backend) = ssh_manager.open_channel(&sess, cols, rows, info.clone()) {
+                                                                tab.revive_ssh(backend, cell_width, cell_height);
+                                                            }
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }
+
                                     last_autosave = Instant::now();
                                     last_title.clear();
                                     show_session_mgr = false;
@@ -782,96 +874,329 @@ fn main() {
             }
         }
 
+        // SSH connect overlay toggle (Cmd+Shift+S)
+        if cmd_held && shift_held && rl.is_key_pressed(KeyboardKey::KEY_S) && !show_help && !show_session_mgr {
+            show_ssh_connect = !show_ssh_connect;
+            if show_ssh_connect {
+                ssh_host.clear();
+                ssh_port = "22".to_string();
+                ssh_user.clear();
+                ssh_password.clear();
+                ssh_focus = 0;
+                ssh_error = None;
+            }
+        }
+
+        // SSH connect overlay input handling
+        if show_ssh_connect {
+            if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
+                show_ssh_connect = false;
+            } else if rl.is_key_pressed(KeyboardKey::KEY_TAB) {
+                ssh_focus = (ssh_focus + 1) % 4;
+            } else if rl.is_key_pressed(KeyboardKey::KEY_ENTER) {
+                let port: u16 = ssh_port.parse().unwrap_or(22);
+                let info = crate::terminal::ssh::SshTabInfo {
+                    host: ssh_host.clone(),
+                    port,
+                    user: ssh_user.clone(),
+                };
+
+                let (cols, rows) = {
+                    let ws = wm.active();
+                    if let Some(fp) = ws.root.panel_by_id(ws.focused_panel_id) {
+                        let tbh = fp.tab_bar.height;
+                        panel_term_size(&fp.rect, pad, minimap_width, tbh, cell_width, cell_height)
+                    } else {
+                        (80, 24)
+                    }
+                };
+
+                let try_connect = |mgr: &mut crate::terminal::ssh::SshConnectionManager| -> Result<crate::terminal::ssh::SshBackend, String> {
+                    let session = mgr.get_or_connect(&info.host, info.port, &info.user, &ssh_password)?;
+                    mgr.open_channel(&session, cols, rows, info.clone())
+                };
+
+                let result = try_connect(&mut ssh_manager);
+                let result = match result {
+                    Ok(backend) => Ok(backend),
+                    Err(_) => {
+                        ssh_manager.remove(&info.host, info.port, &info.user);
+                        try_connect(&mut ssh_manager)
+                    }
+                };
+
+                match result {
+                    Ok(ssh_backend) => {
+                        match crate::tab::TabSession::new_ssh(&config, ssh_backend, cols, rows, cell_width, cell_height) {
+                            Ok(tab) => {
+                                let panel = split::Panel::new(0, tab, cell_height);
+                                let ws_name = format!("{}@{}", info.user, info.host);
+                                wm.add(Workspace {
+                                    name: ws_name,
+                                    root: SplitNode::Leaf(panel),
+                                    focused_panel_id: 0,
+                                    next_panel_id: 1,
+                                    ssh_info: Some(info),
+                                    ssh_password: ssh_password.clone(),
+                                });
+                                let sidebar_w = wm.sidebar_width();
+                                let scr_w = rl.get_screen_width();
+                                let scr_h = rl.get_screen_height();
+                                relayout_and_resize(&mut wm.active_mut().root, scr_w, scr_h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
+                                show_ssh_connect = false;
+                                last_title.clear();
+                            }
+                            Err(e) => {
+                                ssh_error = Some(format!("Tab creation failed: {e}"));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        ssh_error = Some(e);
+                    }
+                }
+            } else {
+                let field = match ssh_focus {
+                    0 => &mut ssh_host,
+                    1 => &mut ssh_port,
+                    2 => &mut ssh_user,
+                    _ => &mut ssh_password,
+                };
+                if rl.is_key_pressed(KeyboardKey::KEY_BACKSPACE) || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_BACKSPACE as i32) } {
+                    field.pop();
+                } else {
+                    loop {
+                        let ch = unsafe { raylib::ffi::GetCharPressed() };
+                        if ch == 0 { break; }
+                        if let Some(c) = char::from_u32(ch as u32) {
+                            field.push(c);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Sidebar rename input handling
+        if wm.renaming.is_some() {
+            if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
+                wm.renaming = None;
+                wm.rename_buf.clear();
+            } else if rl.is_key_pressed(KeyboardKey::KEY_ENTER) {
+                if let Some(idx) = wm.renaming {
+                    let trimmed = wm.rename_buf.trim().to_string();
+                    if !trimmed.is_empty() && idx < wm.workspaces.len() {
+                        wm.workspaces[idx].name = trimmed;
+                    }
+                }
+                wm.renaming = None;
+                wm.rename_buf.clear();
+            } else {
+                if rl.is_key_pressed(KeyboardKey::KEY_BACKSPACE) || unsafe { raylib::ffi::IsKeyPressedRepeat(KeyboardKey::KEY_BACKSPACE as i32) } {
+                    wm.rename_buf.pop();
+                } else {
+                    loop {
+                        let ch = unsafe { raylib::ffi::GetCharPressed() };
+                        if ch == 0 { break; }
+                        if let Some(c) = char::from_u32(ch as u32) {
+                            if c as u32 > 31 && c != '\0' && wm.rename_buf.len() < 32 {
+                                wm.rename_buf.push(c);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Split keybindings (Cmd+D, Cmd+Shift+D, Cmd+Shift+W, Cmd+Option+Arrows)
         let mut did_split_action = false;
-        if show_help || show_session_mgr {
+        if show_help || show_session_mgr || show_ssh_connect || wm.renaming.is_some() {
             // all input blocked while overlay is open
         } else if cmd_held && !shift_held && rl.is_key_pressed(KeyboardKey::KEY_D) {
-            let new_id = alloc_panel_id(&mut next_panel_id);
-            if let Some(fp) = root.panel_by_id(focused_panel_id) {
+            let sidebar_w = wm.sidebar_width();
+            let ws = wm.active_mut();
+            let new_id = alloc_panel_id(&mut ws.next_panel_id);
+            if let Some(fp) = ws.root.panel_by_id(ws.focused_panel_id) {
                 let tbh = fp.tab_bar.height;
                 let r = fp.rect;
                 let (cols, rows) = panel_term_size(&PanelRect { x: 0, y: 0, w: r.w / 2, h: r.h }, pad, minimap_width, tbh, cell_width, cell_height);
-                if let Ok(new_panel) = create_panel(new_id, &config, cols, rows, cell_width, cell_height) {
-                    root.split_panel(focused_panel_id, SplitDirection::Horizontal, new_panel);
+                let tab_result = if let Some(ref info) = ws.ssh_info {
+                    ssh_manager.get_or_connect(&info.host, info.port, &info.user, &ws.ssh_password)
+                        .and_then(|s| ssh_manager.open_channel(&s, cols, rows, info.clone()))
+                        .and_then(|backend| TabSession::new_ssh(&config, backend, cols, rows, cell_width, cell_height))
+                } else {
+                    TabSession::new(&config, cols, rows, cell_width, cell_height)
+                };
+                if let Ok(tab) = tab_result {
+                    let new_panel = split::Panel::new(new_id, tab, cell_height);
+                    ws.root.split_panel(ws.focused_panel_id, SplitDirection::Horizontal, new_panel);
                     let scr_w = rl.get_screen_width();
                     let scr_h = rl.get_screen_height();
-                    relayout_and_resize(&mut root, scr_w, scr_h, status_bar_height, pad, minimap_width, cell_width, cell_height);
-                    focused_panel_id = new_id;
+                    relayout_and_resize(&mut ws.root, scr_w, scr_h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
+                    ws.focused_panel_id = new_id;
                     last_title.clear();
                 }
             }
             did_split_action = true;
         } else if cmd_held && shift_held && rl.is_key_pressed(KeyboardKey::KEY_D) {
-            let new_id = alloc_panel_id(&mut next_panel_id);
-            if let Some(fp) = root.panel_by_id(focused_panel_id) {
+            let sidebar_w = wm.sidebar_width();
+            let ws = wm.active_mut();
+            let new_id = alloc_panel_id(&mut ws.next_panel_id);
+            if let Some(fp) = ws.root.panel_by_id(ws.focused_panel_id) {
                 let tbh = fp.tab_bar.height;
                 let r = fp.rect;
                 let (cols, rows) = panel_term_size(&PanelRect { x: 0, y: 0, w: r.w, h: r.h / 2 }, pad, minimap_width, tbh, cell_width, cell_height);
-                if let Ok(new_panel) = create_panel(new_id, &config, cols, rows, cell_width, cell_height) {
-                    root.split_panel(focused_panel_id, SplitDirection::Vertical, new_panel);
+                let tab_result = if let Some(ref info) = ws.ssh_info {
+                    ssh_manager.get_or_connect(&info.host, info.port, &info.user, &ws.ssh_password)
+                        .and_then(|s| ssh_manager.open_channel(&s, cols, rows, info.clone()))
+                        .and_then(|backend| TabSession::new_ssh(&config, backend, cols, rows, cell_width, cell_height))
+                } else {
+                    TabSession::new(&config, cols, rows, cell_width, cell_height)
+                };
+                if let Ok(tab) = tab_result {
+                    let new_panel = split::Panel::new(new_id, tab, cell_height);
+                    ws.root.split_panel(ws.focused_panel_id, SplitDirection::Vertical, new_panel);
                     let scr_w = rl.get_screen_width();
                     let scr_h = rl.get_screen_height();
-                    relayout_and_resize(&mut root, scr_w, scr_h, status_bar_height, pad, minimap_width, cell_width, cell_height);
-                    focused_panel_id = new_id;
+                    relayout_and_resize(&mut ws.root, scr_w, scr_h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
+                    ws.focused_panel_id = new_id;
                     last_title.clear();
                 }
             }
             did_split_action = true;
         } else if cmd_held && shift_held && rl.is_key_pressed(KeyboardKey::KEY_W) {
-            if root.panel_count() > 1 {
-                let leaves = root.collect_leaves();
-                let idx = leaves.iter().position(|&id| id == focused_panel_id).unwrap_or(0);
-                root.close_panel(focused_panel_id);
-                let new_leaves = root.collect_leaves();
-                focused_panel_id = new_leaves[idx.min(new_leaves.len() - 1)];
+            let panel_count = wm.active().root.panel_count();
+            if panel_count > 1 {
+                let ws = wm.active_mut();
+                let fid = ws.focused_panel_id;
+                let leaves = ws.root.collect_leaves();
+                let idx = leaves.iter().position(|&id| id == fid).unwrap_or(0);
+                ws.root.close_panel(fid);
+                let new_leaves = ws.root.collect_leaves();
+                ws.focused_panel_id = new_leaves[idx.min(new_leaves.len() - 1)];
+                let sidebar_w = wm.sidebar_width();
                 let scr_w = rl.get_screen_width();
                 let scr_h = rl.get_screen_height();
-                relayout_and_resize(&mut root, scr_w, scr_h, status_bar_height, pad, minimap_width, cell_width, cell_height);
+                relayout_and_resize(&mut wm.active_mut().root, scr_w, scr_h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
+                last_title.clear();
+            } else if wm.workspaces.len() > 1 {
+                let idx = wm.active;
+                wm.remove(idx);
+                let sidebar_w = wm.sidebar_width();
+                let scr_w = rl.get_screen_width();
+                let scr_h = rl.get_screen_height();
+                relayout_and_resize(&mut wm.active_mut().root, scr_w, scr_h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
                 last_title.clear();
             }
             did_split_action = true;
         } else if cmd_held && alt_held && rl.is_key_pressed(KeyboardKey::KEY_RIGHT) {
-            let leaves = root.collect_leaves();
-            if let Some(idx) = leaves.iter().position(|&id| id == focused_panel_id) {
-                focused_panel_id = leaves[(idx + 1) % leaves.len()];
+            let ws = wm.active_mut();
+            let leaves = ws.root.collect_leaves();
+            if let Some(idx) = leaves.iter().position(|&id| id == ws.focused_panel_id) {
+                ws.focused_panel_id = leaves[(idx + 1) % leaves.len()];
                 last_title.clear();
             }
             did_split_action = true;
         } else if cmd_held && alt_held && rl.is_key_pressed(KeyboardKey::KEY_LEFT) {
-            let leaves = root.collect_leaves();
-            if let Some(idx) = leaves.iter().position(|&id| id == focused_panel_id) {
-                focused_panel_id = leaves[if idx == 0 { leaves.len() - 1 } else { idx - 1 }];
+            let ws = wm.active_mut();
+            let leaves = ws.root.collect_leaves();
+            if let Some(idx) = leaves.iter().position(|&id| id == ws.focused_panel_id) {
+                ws.focused_panel_id = leaves[if idx == 0 { leaves.len() - 1 } else { idx - 1 }];
                 last_title.clear();
             }
             did_split_action = true;
         } else if cmd_held && alt_held && rl.is_key_pressed(KeyboardKey::KEY_DOWN) {
-            let leaves = root.collect_leaves();
-            if let Some(idx) = leaves.iter().position(|&id| id == focused_panel_id) {
-                focused_panel_id = leaves[(idx + 1) % leaves.len()];
+            let ws = wm.active_mut();
+            let leaves = ws.root.collect_leaves();
+            if let Some(idx) = leaves.iter().position(|&id| id == ws.focused_panel_id) {
+                ws.focused_panel_id = leaves[(idx + 1) % leaves.len()];
                 last_title.clear();
             }
             did_split_action = true;
         } else if cmd_held && alt_held && rl.is_key_pressed(KeyboardKey::KEY_UP) {
-            let leaves = root.collect_leaves();
-            if let Some(idx) = leaves.iter().position(|&id| id == focused_panel_id) {
-                focused_panel_id = leaves[if idx == 0 { leaves.len() - 1 } else { idx - 1 }];
+            let ws = wm.active_mut();
+            let leaves = ws.root.collect_leaves();
+            if let Some(idx) = leaves.iter().position(|&id| id == ws.focused_panel_id) {
+                ws.focused_panel_id = leaves[if idx == 0 { leaves.len() - 1 } else { idx - 1 }];
                 last_title.clear();
             }
             did_split_action = true;
+        } else if cmd_held && !shift_held && !ctrl_held && rl.is_key_pressed(KeyboardKey::KEY_N) {
+            // New local workspace
+            let name = wm.next_name();
+            let future_sidebar_w = if wm.sidebar_visible { SIDEBAR_WIDTH } else { 0 };
+            let scr_w = rl.get_screen_width();
+            let scr_h = rl.get_screen_height();
+            let (root, fid, nid) = create_fresh_panel(&config, scr_w, scr_h, status_bar_height, future_sidebar_w, pad, minimap_width, cell_width, cell_height);
+            wm.add(Workspace {
+                name, root, focused_panel_id: fid, next_panel_id: nid,
+                ssh_info: None, ssh_password: String::new(),
+            });
+            let sidebar_w = wm.sidebar_width();
+            relayout_and_resize(&mut wm.active_mut().root, scr_w, scr_h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
+            last_title.clear();
+            did_split_action = true;
+        } else if ctrl_held && cmd_held && rl.is_key_pressed(KeyboardKey::KEY_RIGHT_BRACKET) {
+            wm.next();
+            let sidebar_w = wm.sidebar_width();
+            let scr_w = rl.get_screen_width();
+            let scr_h = rl.get_screen_height();
+            relayout_and_resize(&mut wm.active_mut().root, scr_w, scr_h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
+            last_title.clear();
+            did_split_action = true;
+        } else if ctrl_held && cmd_held && rl.is_key_pressed(KeyboardKey::KEY_LEFT_BRACKET) {
+            wm.prev();
+            let sidebar_w = wm.sidebar_width();
+            let scr_w = rl.get_screen_width();
+            let scr_h = rl.get_screen_height();
+            relayout_and_resize(&mut wm.active_mut().root, scr_w, scr_h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
+            last_title.clear();
+            did_split_action = true;
+        } else if ctrl_held && cmd_held {
+            let key_nums = [
+                KeyboardKey::KEY_ONE, KeyboardKey::KEY_TWO, KeyboardKey::KEY_THREE,
+                KeyboardKey::KEY_FOUR, KeyboardKey::KEY_FIVE, KeyboardKey::KEY_SIX,
+                KeyboardKey::KEY_SEVEN, KeyboardKey::KEY_EIGHT, KeyboardKey::KEY_NINE,
+            ];
+            for (i, &key) in key_nums.iter().enumerate() {
+                if rl.is_key_pressed(key) && i < wm.workspaces.len() {
+                    wm.switch_to(i);
+                    let sidebar_w = wm.sidebar_width();
+                    let scr_w = rl.get_screen_width();
+                    let scr_h = rl.get_screen_height();
+                    relayout_and_resize(&mut wm.active_mut().root, scr_w, scr_h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
+                    last_title.clear();
+                    did_split_action = true;
+                    break;
+                }
+            }
+        } else if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_BACKSLASH) {
+            wm.sidebar_visible = !wm.sidebar_visible;
+            let sidebar_w = wm.sidebar_width();
+            let scr_w = rl.get_screen_width();
+            let scr_h = rl.get_screen_height();
+            relayout_and_resize(&mut wm.active_mut().root, scr_w, scr_h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
+            did_split_action = true;
         }
 
-        if show_session_mgr {
-            // input handled by session manager above
+        if show_session_mgr || show_ssh_connect || wm.renaming.is_some() {
+            // input handled by overlay above
         } else if did_split_action {
             // skip other keybindings this frame
         } else {
             // Tab management keybindings (scoped to focused panel)
             let mut tab_action_done = false;
             if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_T) {
-                if let Some(panel) = root.panel_by_id_mut(focused_panel_id) {
+                let ws = wm.active_mut();
+                if let Some(panel) = ws.root.panel_by_id_mut(ws.focused_panel_id) {
                     let (cols, rows) = panel_term_size(&panel.rect, pad, minimap_width, panel.tab_bar.height, cell_width, cell_height);
-                    if let Ok(t) = TabSession::new(&config, cols, rows, cell_width, cell_height) {
+                    let tab_result = if let Some(ref info) = ws.ssh_info {
+                        let sess = ssh_manager.get_or_connect(&info.host, info.port, &info.user, &ws.ssh_password);
+                        sess.and_then(|s| ssh_manager.open_channel(&s, cols, rows, info.clone()))
+                            .and_then(|backend| TabSession::new_ssh(&config, backend, cols, rows, cell_width, cell_height))
+                    } else {
+                        TabSession::new(&config, cols, rows, cell_width, cell_height)
+                    };
+                    if let Ok(t) = tab_result {
                         panel.tabs.push(t);
                         panel.active_tab = panel.tabs.len() - 1;
                         last_title.clear();
@@ -879,42 +1204,61 @@ fn main() {
                 }
                 tab_action_done = true;
             } else if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_W) {
-                if let Some(panel) = root.panel_by_id_mut(focused_panel_id) {
-                    panel.tabs.remove(panel.active_tab);
-                    if panel.tabs.is_empty() {
-                        if root.panel_count() <= 1 {
-                            app_exit = true;
+                // Phase 1: remove the tab
+                let mut tab_removed_empty = false;
+                {
+                    let ws = wm.active_mut();
+                    if let Some(panel) = ws.root.panel_by_id_mut(ws.focused_panel_id) {
+                        panel.tabs.remove(panel.active_tab);
+                        if panel.tabs.is_empty() {
+                            tab_removed_empty = true;
+                        } else {
+                            panel.active_tab = panel.active_tab.min(panel.tabs.len() - 1);
+                            last_title.clear();
                         }
-                        // will close panel below
+                    }
+                }
+                // Phase 2: handle empty panel
+                if tab_removed_empty {
+                    let panel_count = wm.active().root.panel_count();
+                    if panel_count <= 1 {
+                        if wm.workspaces.len() <= 1 {
+                            app_exit = true;
+                        } else {
+                            let idx = wm.active;
+                            wm.remove(idx);
+                            let sidebar_w = wm.sidebar_width();
+                            let scr_w = rl.get_screen_width();
+                            let scr_h = rl.get_screen_height();
+                            relayout_and_resize(&mut wm.active_mut().root, scr_w, scr_h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
+                            last_title.clear();
+                        }
                     } else {
-                        panel.active_tab = panel.active_tab.min(panel.tabs.len() - 1);
+                        let sidebar_w = wm.sidebar_width();
+                        let ws = wm.active_mut();
+                        let fid = ws.focused_panel_id;
+                        let leaves = ws.root.collect_leaves();
+                        let idx = leaves.iter().position(|&id| id == fid).unwrap_or(0);
+                        ws.root.close_panel(fid);
+                        let new_leaves = ws.root.collect_leaves();
+                        ws.focused_panel_id = new_leaves[idx.min(new_leaves.len() - 1)];
+                        let scr_w = rl.get_screen_width();
+                        let scr_h = rl.get_screen_height();
+                        relayout_and_resize(&mut ws.root, scr_w, scr_h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
                         last_title.clear();
                     }
                 }
-                // If the panel became empty and there are other panels, close it
-                let should_close = root.panel_by_id(focused_panel_id)
-                    .map(|p| p.tabs.is_empty())
-                    .unwrap_or(false);
-                if should_close && !app_exit && root.panel_count() > 1 {
-                    let leaves = root.collect_leaves();
-                    let idx = leaves.iter().position(|&id| id == focused_panel_id).unwrap_or(0);
-                    root.close_panel(focused_panel_id);
-                    let new_leaves = root.collect_leaves();
-                    focused_panel_id = new_leaves[idx.min(new_leaves.len() - 1)];
-                    let scr_w = rl.get_screen_width();
-                    let scr_h = rl.get_screen_height();
-                    relayout_and_resize(&mut root, scr_w, scr_h, status_bar_height, pad, minimap_width, cell_width, cell_height);
-                    last_title.clear();
-                }
                 tab_action_done = true;
             } else if cmd_held && shift_held && rl.is_key_pressed(KeyboardKey::KEY_RIGHT_BRACKET) {
-                if let Some(panel) = root.panel_by_id_mut(focused_panel_id) {
+                let ws = wm.active_mut();
+                if let Some(panel) = ws.root.panel_by_id_mut(ws.focused_panel_id) {
                     panel.active_tab = (panel.active_tab + 1) % panel.tabs.len();
                     last_title.clear();
                 }
                 tab_action_done = true;
             } else if cmd_held && shift_held && rl.is_key_pressed(KeyboardKey::KEY_LEFT_BRACKET) {
-                if let Some(panel) = root.panel_by_id_mut(focused_panel_id) {
+                let ws = wm.active_mut();
+                if let Some(panel) = ws.root.panel_by_id_mut(ws.focused_panel_id) {
                     panel.active_tab = if panel.active_tab == 0 { panel.tabs.len() - 1 } else { panel.active_tab - 1 };
                     last_title.clear();
                 }
@@ -925,9 +1269,10 @@ fn main() {
                     KeyboardKey::KEY_FOUR, KeyboardKey::KEY_FIVE, KeyboardKey::KEY_SIX,
                     KeyboardKey::KEY_SEVEN, KeyboardKey::KEY_EIGHT, KeyboardKey::KEY_NINE,
                 ];
+                let ws = wm.active_mut();
                 for (i, &key) in key_nums.iter().enumerate() {
                     if rl.is_key_pressed(key) {
-                        if let Some(panel) = root.panel_by_id_mut(focused_panel_id) {
+                        if let Some(panel) = ws.root.panel_by_id_mut(ws.focused_panel_id) {
                             if i < panel.tabs.len() {
                                 panel.active_tab = i;
                                 last_title.clear();
@@ -961,17 +1306,21 @@ fn main() {
                     cell_width = metrics.cell_width;
                     cell_height = metrics.cell_height;
                     status_bar_height = font_size + 8;
-                    root.for_each_panel_mut(&mut |panel| {
-                        panel.tab_bar.update_height(cell_height);
-                    });
+                    for ws in &mut wm.workspaces {
+                        ws.root.for_each_panel_mut(&mut |panel| {
+                            panel.tab_bar.update_height(cell_height);
+                        });
+                    }
                     unsafe { raylib::ffi::UnloadFont(old_font); }
                     let w = rl.get_screen_width();
                     let h = rl.get_screen_height();
-                    relayout_and_resize(&mut root, w, h, status_bar_height, pad, minimap_width, cell_width, cell_height);
+                    let sidebar_w = wm.sidebar_width();
+                    relayout_and_resize(&mut wm.active_mut().root, w, h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
                 }
 
                 // Copy/Paste (focused panel's active tab)
-                if let Some(panel) = root.panel_by_id_mut(focused_panel_id) {
+                let ws = wm.active_mut();
+                if let Some(panel) = ws.root.panel_by_id_mut(ws.focused_panel_id) {
                     let tab = panel.active_tab_mut();
                     if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_C) {
                         if tab.selection.has_selection() {
@@ -986,7 +1335,7 @@ fn main() {
                     if cmd_held && rl.is_key_pressed(KeyboardKey::KEY_V) {
                         if let Some(text) = selection::paste_from_clipboard() {
                             if !text.is_empty() {
-                                tab.pty.write(text.as_bytes());
+                                tab.backend.write(text.as_bytes());
                             }
                         }
                     }
@@ -996,10 +1345,123 @@ fn main() {
                 {
                     let mx = rl.get_mouse_x();
                     let my = rl.get_mouse_y();
+                    let sidebar_w = wm.sidebar_width();
+
+                    // Sidebar mouse handling
+                    if sidebar_w > 0 && mx < sidebar_w {
+                        let wheel = unsafe { raylib::ffi::GetMouseWheelMove() } as i32;
+                        if wheel != 0 {
+                            let scr_h = rl.get_screen_height();
+                            let max_scroll = (wm.workspaces.len() as i32 * ROW_HEIGHT - scr_h + SIDEBAR_BUTTON_HEIGHT).max(0);
+                            wm.sidebar_scroll = (wm.sidebar_scroll - wheel * ROW_HEIGHT).max(0).min(max_scroll);
+                        }
+
+                        // Dismiss context menu on any click outside it
+                        if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
+                            if wm.context_menu.is_some() {
+                                let dismiss = if let Some((_, cmx, cmy)) = wm.context_menu {
+                                    let cm_w = 140;
+                                    let cm_h = 64;
+                                    !(mx >= cmx && mx < cmx + cm_w && my >= cmy && my < cmy + cm_h)
+                                } else { true };
+                                if dismiss { wm.context_menu = None; }
+                            }
+                        }
+
+                        // Context menu click handling
+                        if let Some((ctx_idx, cmx, cmy)) = wm.context_menu {
+                            let cm_w = 140;
+                            let item_h = 28;
+                            if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT)
+                                && mx >= cmx && mx < cmx + cm_w && my >= cmy && my < cmy + item_h * 2
+                            {
+                                let item = (my - cmy) / item_h;
+                                if item == 0 {
+                                    wm.renaming = Some(ctx_idx);
+                                    wm.rename_buf = wm.workspaces[ctx_idx].name.clone();
+                                    wm.context_menu = None;
+                                } else if item == 1 && wm.workspaces.len() > 1 {
+                                    wm.remove(ctx_idx);
+                                    wm.context_menu = None;
+                                    let sidebar_w2 = wm.sidebar_width();
+                                    let scr_w2 = rl.get_screen_width();
+                                    let scr_h2 = rl.get_screen_height();
+                                    relayout_and_resize(&mut wm.active_mut().root, scr_w2, scr_h2, status_bar_height, sidebar_w2, pad, minimap_width, cell_width, cell_height);
+                                    last_title.clear();
+                                } else {
+                                    wm.context_menu = None;
+                                }
+                            }
+                        } else if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
+                            let scroll = wm.sidebar_scroll;
+                            let scr_h = rl.get_screen_height();
+                            let plus_btn_y = scr_h - SIDEBAR_BUTTON_HEIGHT;
+
+                            if my >= plus_btn_y {
+                                // '+' button clicked — create new workspace
+                                let name = wm.next_name();
+                                let future_sidebar_w = if wm.sidebar_visible { SIDEBAR_WIDTH } else { 0 };
+                                let scr_w = rl.get_screen_width();
+                                let (root, fid, nid) = create_fresh_panel(&config, scr_w, scr_h, status_bar_height, future_sidebar_w, pad, minimap_width, cell_width, cell_height);
+                                wm.add(Workspace {
+                                    name, root, focused_panel_id: fid, next_panel_id: nid,
+                                    ssh_info: None, ssh_password: String::new(),
+                                });
+                                let sidebar_w2 = wm.sidebar_width();
+                                relayout_and_resize(&mut wm.active_mut().root, scr_w, scr_h, status_bar_height, sidebar_w2, pad, minimap_width, cell_width, cell_height);
+                                last_title.clear();
+                            } else {
+                                let clicked_idx = ((my + scroll) / ROW_HEIGHT) as usize;
+                                if clicked_idx < wm.workspaces.len() {
+                                    let now = Instant::now();
+                                    let is_double = if let Some((prev_idx, prev_time)) = sidebar_last_click {
+                                        prev_idx == clicked_idx && now.duration_since(prev_time).as_millis() < 400
+                                    } else { false };
+
+                                    if is_double {
+                                        wm.renaming = Some(clicked_idx);
+                                        wm.rename_buf = wm.workspaces[clicked_idx].name.clone();
+                                        sidebar_last_click = None;
+                                    } else {
+                                        sidebar_last_click = Some((clicked_idx, now));
+                                        if clicked_idx != wm.active {
+                                            wm.switch_to(clicked_idx);
+                                            let sidebar_w2 = wm.sidebar_width();
+                                            let scr_w = rl.get_screen_width();
+                                            let scr_h2 = rl.get_screen_height();
+                                            relayout_and_resize(&mut wm.active_mut().root, scr_w, scr_h2, status_bar_height, sidebar_w2, pad, minimap_width, cell_width, cell_height);
+                                            last_title.clear();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Right-click on workspace item -> context menu
+                        if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_RIGHT) {
+                            let scroll = wm.sidebar_scroll;
+                            let clicked_idx = ((my + scroll) / ROW_HEIGHT) as usize;
+                            if clicked_idx < wm.workspaces.len() {
+                                wm.context_menu = Some((clicked_idx, mx, my));
+                            }
+                        }
+                    } else {
+                        // Click outside sidebar dismisses context menu and rename
+                        if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) || rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_RIGHT) {
+                            wm.context_menu = None;
+                            if let Some(idx) = wm.renaming {
+                                let trimmed = wm.rename_buf.trim().to_string();
+                                if !trimmed.is_empty() && idx < wm.workspaces.len() {
+                                    wm.workspaces[idx].name = trimmed;
+                                }
+                                wm.renaming = None;
+                                wm.rename_buf.clear();
+                            }
+                        }
 
                     // Check if any panel's minimap is being dragged
                     let mut dragging_panel_id: Option<u32> = None;
-                    root.for_each_panel(&mut |panel| {
+                    wm.active().root.for_each_panel(&mut |panel| {
                         let tab = &panel.tabs[panel.active_tab];
                         if tab.minimap.dragging {
                             dragging_panel_id = Some(panel.id);
@@ -1009,15 +1471,16 @@ fn main() {
                     let hover_panel_id = if let Some(drag_id) = dragging_panel_id {
                         Some(drag_id)
                     } else {
-                        root.find_panel_at(mx, my).map(|p| p.id)
+                        wm.active_mut().root.find_panel_at(mx, my).map(|p| p.id)
                     };
 
                     if let Some(hpid) = hover_panel_id {
                         if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
-                            focused_panel_id = hpid;
+                            wm.active_mut().focused_panel_id = hpid;
                         }
 
-                        if let Some(panel) = root.panel_by_id_mut(hpid) {
+                        let ws = wm.active_mut();
+                        if let Some(panel) = ws.root.panel_by_id_mut(hpid) {
                             let r = panel.rect;
                             let local_mx = mx - r.x;
                             let local_my = my - r.y;
@@ -1043,7 +1506,14 @@ fn main() {
                                         }
                                         TabBarAction::New => {
                                             let (cols, rows) = panel_term_size(&r, pad, minimap_width, tab_bar_h, cell_width, cell_height);
-                                            if let Ok(t) = TabSession::new(&config, cols, rows, cell_width, cell_height) {
+                                            let tab_result = if let Some(ref info) = ws.ssh_info {
+                                                ssh_manager.get_or_connect(&info.host, info.port, &info.user, &ws.ssh_password)
+                                                    .and_then(|s| ssh_manager.open_channel(&s, cols, rows, info.clone()))
+                                                    .and_then(|backend| TabSession::new_ssh(&config, backend, cols, rows, cell_width, cell_height))
+                                            } else {
+                                                TabSession::new(&config, cols, rows, cell_width, cell_height)
+                                            };
+                                            if let Ok(t) = tab_result {
                                                 panel.tabs.push(t);
                                                 panel.active_tab = panel.tabs.len() - 1;
                                                 last_title.clear();
@@ -1082,7 +1552,7 @@ fn main() {
                                 } else {
                                     // Terminal area: always call handle_mouse for mouse tracking + scroll wheel
                                     terminal::input::handle_mouse(
-                                        &rl, &mut tab.term, &tab.pty,
+                                        &rl, &mut tab.term, &mut tab.backend,
                                         cell_width, cell_height,
                                         pad, pad + tab_bar_h,
                                         pad + minimap_width,
@@ -1106,28 +1576,43 @@ fn main() {
                     }
 
                     // Close empty panels from tab bar close button
-                    let empty_panel = root.panel_by_id(focused_panel_id)
+                    let empty_panel = wm.active().root.panel_by_id(wm.active().focused_panel_id)
                         .map(|p| p.tabs.is_empty())
                         .unwrap_or(false);
                     if empty_panel {
-                        if root.panel_count() <= 1 {
-                            app_exit = true;
+                        if wm.active().root.panel_count() <= 1 {
+                            if wm.workspaces.len() <= 1 {
+                                app_exit = true;
+                            } else {
+                                let idx = wm.active;
+                                wm.remove(idx);
+                                let sidebar_w = wm.sidebar_width();
+                                let scr_w = rl.get_screen_width();
+                                let scr_h = rl.get_screen_height();
+                                relayout_and_resize(&mut wm.active_mut().root, scr_w, scr_h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
+                                last_title.clear();
+                            }
                         } else {
-                            let leaves = root.collect_leaves();
-                            let idx = leaves.iter().position(|&id| id == focused_panel_id).unwrap_or(0);
-                            root.close_panel(focused_panel_id);
-                            let new_leaves = root.collect_leaves();
-                            focused_panel_id = new_leaves[idx.min(new_leaves.len() - 1)];
+                            let sidebar_w = wm.sidebar_width();
+                            let ws = wm.active_mut();
+                            let fid = ws.focused_panel_id;
+                            let leaves = ws.root.collect_leaves();
+                            let idx = leaves.iter().position(|&id| id == fid).unwrap_or(0);
+                            ws.root.close_panel(fid);
+                            let new_leaves = ws.root.collect_leaves();
+                            ws.focused_panel_id = new_leaves[idx.min(new_leaves.len() - 1)];
                             let scr_w = rl.get_screen_width();
                             let scr_h = rl.get_screen_height();
-                            relayout_and_resize(&mut root, scr_w, scr_h, status_bar_height, pad, minimap_width, cell_width, cell_height);
+                            relayout_and_resize(&mut ws.root, scr_w, scr_h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
                             last_title.clear();
                         }
                     }
-                }
+                } // end else (not sidebar)
+                } // end mouse handling block
 
                 // Keyboard input dispatch -- focused panel only
-                if let Some(panel) = root.panel_by_id_mut(focused_panel_id) {
+                let ws = wm.active_mut();
+                if let Some(panel) = ws.root.panel_by_id_mut(ws.focused_panel_id) {
                     if !panel.tabs.is_empty() {
                         let tab = &mut panel.tabs[panel.active_tab];
                         let mode = tab.router.mode();
@@ -1140,7 +1625,7 @@ fn main() {
                             match mode {
                                 InputMode::Shell => {
                                     if !tab.child_exited {
-                                        let chars = terminal::input::handle_input(&rl, &mut tab.term, &tab.pty);
+                                        let chars = terminal::input::handle_input(&rl, &mut tab.term, &mut tab.backend);
                                         for c in chars {
                                             tab.router.track_shell_char(c);
                                         }
@@ -1177,7 +1662,7 @@ fn main() {
                                         tab.router.handle_ai_prompt_history_down();
                                     }
                                     if rl.is_key_pressed(KeyboardKey::KEY_ENTER) && !ctrl {
-                                        tab.router.handle_ai_prompt_submit(&mut tab.term, &tab.pty);
+                                        tab.router.handle_ai_prompt_submit(&mut tab.term, &mut tab.backend);
                                     }
                                     if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
                                         tab.router.handle_ai_prompt_cancel();
@@ -1190,11 +1675,11 @@ fn main() {
                                 }
                                 InputMode::CommandConfirm => {
                                     if rl.is_key_pressed(KeyboardKey::KEY_ENTER) {
-                                        tab.router.handle_command_confirm_enter(&mut tab.term, &tab.pty, &mut tab.overlay);
+                                        tab.router.handle_command_confirm_enter(&mut tab.term, &mut tab.backend, &mut tab.overlay);
                                     } else if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
-                                        tab.router.handle_command_confirm_cancel(&tab.pty, &mut tab.overlay);
+                                        tab.router.handle_command_confirm_cancel(&mut tab.backend, &mut tab.overlay);
                                     } else if rl.is_key_pressed(KeyboardKey::KEY_E) {
-                                        tab.router.handle_command_confirm_edit(&tab.pty, &mut tab.overlay);
+                                        tab.router.handle_command_confirm_edit(&mut tab.backend, &mut tab.overlay);
                                     }
                                 }
                             }
@@ -1214,20 +1699,28 @@ fn main() {
         let focused_auto_exec;
         let focused_cwd;
         let focused_panel_rect;
-        let panel_count = root.panel_count();
+        let panel_count = wm.active().root.panel_count();
 
         let panel_info;
         {
-            let leaves = root.collect_leaves();
-            let panel_idx = leaves.iter().position(|&id| id == focused_panel_id).unwrap_or(0) + 1;
-            if let Some(fp) = root.panel_by_id(focused_panel_id) {
+            let ws = wm.active();
+            let leaves = ws.root.collect_leaves();
+            let panel_idx = leaves.iter().position(|&id| id == ws.focused_panel_id).unwrap_or(0) + 1;
+            if let Some(fp) = ws.root.panel_by_id(ws.focused_panel_id) {
                 let tab = fp.active_tab();
                 focused_mode = tab.router.mode();
                 focused_ai_input = tab.router.ai_input_buffer().to_string();
                 focused_auto_exec = tab.router.auto_execute();
-                focused_cwd = tab.pty.get_cwd()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "~".to_string());
+                focused_cwd = if let Some(ref info) = tab.ssh_info {
+                    format!("ssh://{}@{}:{}", info.user, info.host, info.port)
+                } else if let Some(ref info) = ws.ssh_info {
+                    format!("[SSH {}@{}] {}", info.user, info.host,
+                        tab.backend.get_cwd().map(|p| p.display().to_string()).unwrap_or_else(|| "~".to_string()))
+                } else {
+                    tab.backend.get_cwd()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "~".to_string())
+                };
                 focused_panel_rect = fp.rect;
                 panel_info = Some((panel_idx, panel_count, fp.active_tab + 1, fp.tabs.len()));
             } else {
@@ -1246,10 +1739,11 @@ fn main() {
         // Clear with dark background first
         d.clear_background(Color::new(20, 20, 25, 255));
 
-        // Render all panels
-        root.for_each_panel_mut(&mut |panel| {
+        // Render all panels (active workspace only)
+        let ws_focused_panel_id = wm.active().focused_panel_id;
+        wm.active_mut().root.for_each_panel_mut(&mut |panel| {
             let r = panel.rect;
-            let is_focused = panel.id == focused_panel_id;
+            let is_focused = panel.id == ws_focused_panel_id;
 
             let tab_titles: Vec<String> = panel.tabs.iter().map(|t| t.title()).collect();
             let active_idx = panel.active_tab;
@@ -1347,7 +1841,7 @@ fn main() {
         });
 
         // Separator lines between panels
-        root.draw_separators(&mut d);
+        wm.active().root.draw_separators(&mut d);
 
         // Floating AI prompt panel (focused panel only)
         if focused_mode == InputMode::AiPrompt {
@@ -1422,45 +1916,58 @@ fn main() {
             }
         }
 
-        // Help panel overlay
+        // Help panel overlay (two-column layout)
         if show_help {
             let screen_w = d.get_screen_width();
             let screen_h = d.get_screen_height();
 
             d.draw_rectangle(0, 0, screen_w, screen_h, Color::new(0, 0, 0, 160));
 
-            let help_w = 520.min(screen_w - 40);
-            let help_x = (screen_w - help_w) / 2;
+            let content_x = wm.sidebar_width();
+            let content_w = screen_w - content_x;
             let line_h = cell_height + 2;
-            let inner_pad = 16;
-            let section_gap = 6;
+            let inner_pad = 20;
+            let section_gap = 10;
+            let label_size = (font_size - 2).max(8);
+            let key_col_w = 170;
 
-            let sections: &[(&str, &[(&str, &str)])] = &[
+            // Left column: General, Workspaces, Tabs, Splits
+            // Right column: Font, AI Prompt, Command Confirm, Session
+            let left_sections: &[(&str, &[(&str, &str)])] = &[
                 ("General", &[
                     ("F1", "Toggle this help panel"),
                     ("F2", "Session manager"),
+                    ("Cmd+Shift+S", "New SSH workspace"),
                     ("Ctrl+/", "Toggle AI prompt"),
                     ("Ctrl+Y", "Toggle YOLO (auto-execute)"),
                     ("Cmd+C", "Copy selection"),
                     ("Cmd+V", "Paste from clipboard"),
                 ]),
+                ("Workspaces", &[
+                    ("Cmd+N", "New local workspace"),
+                    ("Ctrl+Cmd+]  /  [", "Next / prev workspace"),
+                    ("Ctrl+Cmd+1..9", "Jump to workspace N"),
+                    ("Cmd+\\", "Toggle sidebar"),
+                    ("Double-click", "Rename workspace"),
+                    ("Right-click", "Context menu"),
+                ]),
                 ("Tabs", &[
                     ("Cmd+T", "New tab"),
                     ("Cmd+W", "Close tab"),
-                    ("Cmd+Shift+]", "Next tab"),
-                    ("Cmd+Shift+[", "Previous tab"),
+                    ("Cmd+Shift+]  /  [", "Next / prev tab"),
                     ("Cmd+1..9", "Jump to tab N"),
                 ]),
+            ];
+
+            let right_sections: &[(&str, &[(&str, &str)])] = &[
                 ("Splits", &[
                     ("Cmd+D", "Split horizontal"),
                     ("Cmd+Shift+D", "Split vertical"),
-                    ("Cmd+Shift+W", "Close panel"),
-                    ("Cmd+Opt+Right/Down", "Focus next panel"),
-                    ("Cmd+Opt+Left/Up", "Focus previous panel"),
+                    ("Cmd+Shift+W", "Close panel/workspace"),
+                    ("Cmd+Opt+Arrow", "Focus next/prev panel"),
                 ]),
                 ("Font", &[
-                    ("Cmd++", "Increase font size"),
-                    ("Cmd+-", "Decrease font size"),
+                    ("Cmd++  /  -", "Increase / decrease"),
                     ("Cmd+0", "Reset font size"),
                 ]),
                 ("AI Prompt", &[
@@ -1482,83 +1989,115 @@ fn main() {
                 ]),
             ];
 
-            let title_h = cell_height + 8;
-            let mut total_lines = 0;
-            for (_, entries) in sections {
-                total_lines += 1 + entries.len();
-            }
-            total_lines += sections.len().saturating_sub(1);
+            let col_height = |sections: &[(&str, &[(&str, &str)])]| -> i32 {
+                let mut h = 0i32;
+                for (si, (_, entries)) in sections.iter().enumerate() {
+                    if si > 0 { h += section_gap; }
+                    h += line_h; // section header
+                    h += entries.len() as i32 * line_h;
+                }
+                h
+            };
 
-            let help_h = title_h + inner_pad * 2 + total_lines as i32 * line_h + (sections.len() as i32 - 1) * section_gap;
-            let help_h = help_h.min(screen_h - 40);
+            let left_h = col_height(left_sections);
+            let right_h = col_height(right_sections);
+            let body_content_h = left_h.max(right_h) + inner_pad;
+
+            let title_h = cell_height + 12;
+            let footer_h = cell_height + 8;
+            let col_w = 420;
+            let divider_gap = 24;
+            let help_w = (inner_pad + col_w + divider_gap + col_w + inner_pad).min(content_w - 40);
+            let help_h = (title_h + body_content_h + footer_h).min(screen_h - 40);
+            let help_x = content_x + (content_w - help_w) / 2;
             let help_y = (screen_h - help_h) / 2;
+            let body_h = help_h - title_h - footer_h;
 
-            d.draw_rectangle(help_x, help_y, help_w, help_h, Color::new(25, 25, 32, 250));
-            d.draw_rectangle(help_x, help_y, help_w, 1, Color::new(70, 80, 110, 220));
-            d.draw_rectangle(help_x, help_y + help_h - 1, help_w, 1, Color::new(70, 80, 110, 220));
-            d.draw_rectangle(help_x, help_y, 1, help_h, Color::new(70, 80, 110, 220));
-            d.draw_rectangle(help_x + help_w - 1, help_y, 1, help_h, Color::new(70, 80, 110, 220));
+            let max_help_scroll = (body_content_h - body_h).max(0);
+            help_scroll = help_scroll.min(max_help_scroll);
 
+            // Background + border
+            d.draw_rectangle(help_x, help_y, help_w, help_h, Color::new(22, 22, 30, 250));
+            d.draw_rectangle_lines(help_x, help_y, help_w, help_h, Color::new(60, 70, 100, 200));
+
+            // Title
             let title = std::ffi::CString::new("Keyboard Shortcuts").unwrap_or_default();
             unsafe {
                 raylib::ffi::DrawTextEx(
                     mono_font, title.as_ptr(),
-                    raylib::ffi::Vector2 { x: (help_x + inner_pad) as f32, y: (help_y + inner_pad / 2 + 2) as f32 },
+                    raylib::ffi::Vector2 { x: (help_x + inner_pad) as f32, y: (help_y + (title_h - font_size) / 2) as f32 },
                     font_size as f32, 0.0,
                     raylib::ffi::Color { r: 220, g: 225, b: 240, a: 255 },
                 );
             }
+            d.draw_rectangle(help_x + inner_pad, help_y + title_h - 1, help_w - inner_pad * 2, 1, Color::new(55, 60, 75, 180));
 
-            d.draw_rectangle(help_x + inner_pad, help_y + title_h, help_w - inner_pad * 2, 1, Color::new(55, 60, 75, 180));
+            let body_y = help_y + title_h;
 
-            let label_size = (font_size - 2).max(8);
-            let key_col_w = 200;
-            let mut cy = help_y + title_h + inner_pad;
+            unsafe { raylib::ffi::BeginScissorMode(help_x, body_y, help_w, body_h); }
 
-            for (si, (section_name, entries)) in sections.iter().enumerate() {
-                if si > 0 {
-                    cy += section_gap;
-                }
-
-                let section_c = std::ffi::CString::new(*section_name).unwrap_or_default();
-                unsafe {
-                    raylib::ffi::DrawTextEx(
-                        mono_font, section_c.as_ptr(),
-                        raylib::ffi::Vector2 { x: (help_x + inner_pad) as f32, y: cy as f32 },
-                        label_size as f32, 0.0,
-                        raylib::ffi::Color { r: 80, g: 140, b: 220, a: 255 },
-                    );
-                }
-                cy += line_h;
-
-                for (key, desc) in *entries {
-                    let key_c = std::ffi::CString::new(*key).unwrap_or_default();
-                    let desc_c = std::ffi::CString::new(*desc).unwrap_or_default();
+            let draw_column = |sections: &[(&str, &[(&str, &str)])], col_x: i32, start_y: i32, scroll: i32| {
+                let mut cy = start_y - scroll;
+                for (si, (section_name, entries)) in sections.iter().enumerate() {
+                    if si > 0 { cy += section_gap; }
+                    let section_c = std::ffi::CString::new(*section_name).unwrap_or_default();
                     unsafe {
                         raylib::ffi::DrawTextEx(
-                            mono_font, key_c.as_ptr(),
-                            raylib::ffi::Vector2 { x: (help_x + inner_pad + 10) as f32, y: cy as f32 },
+                            mono_font, section_c.as_ptr(),
+                            raylib::ffi::Vector2 { x: col_x as f32, y: cy as f32 },
                             label_size as f32, 0.0,
-                            raylib::ffi::Color { r: 200, g: 200, b: 140, a: 255 },
-                        );
-                        raylib::ffi::DrawTextEx(
-                            mono_font, desc_c.as_ptr(),
-                            raylib::ffi::Vector2 { x: (help_x + inner_pad + key_col_w) as f32, y: cy as f32 },
-                            label_size as f32, 0.0,
-                            raylib::ffi::Color { r: 180, g: 180, b: 190, a: 255 },
+                            raylib::ffi::Color { r: 80, g: 140, b: 220, a: 255 },
                         );
                     }
                     cy += line_h;
-                }
-            }
 
-            let hint = std::ffi::CString::new("Press F1 or Esc to close").unwrap_or_default();
+                    for (key, desc) in *entries {
+                        let key_c = std::ffi::CString::new(*key).unwrap_or_default();
+                        let desc_c = std::ffi::CString::new(*desc).unwrap_or_default();
+                        unsafe {
+                            raylib::ffi::DrawTextEx(
+                                mono_font, key_c.as_ptr(),
+                                raylib::ffi::Vector2 { x: (col_x + 8) as f32, y: cy as f32 },
+                                label_size as f32, 0.0,
+                                raylib::ffi::Color { r: 200, g: 200, b: 140, a: 255 },
+                            );
+                            raylib::ffi::DrawTextEx(
+                                mono_font, desc_c.as_ptr(),
+                                raylib::ffi::Vector2 { x: (col_x + key_col_w) as f32, y: cy as f32 },
+                                label_size as f32, 0.0,
+                                raylib::ffi::Color { r: 180, g: 180, b: 190, a: 255 },
+                            );
+                        }
+                        cy += line_h;
+                    }
+                }
+            };
+
+            let left_x = help_x + inner_pad;
+            let right_x = help_x + inner_pad + col_w + divider_gap;
+            let col_start_y = body_y + inner_pad / 2;
+
+            draw_column(left_sections, left_x, col_start_y, help_scroll);
+            draw_column(right_sections, right_x, col_start_y, help_scroll);
+
+            // Vertical divider between columns
+            let div_x = help_x + inner_pad + col_w + divider_gap / 2;
+            d.draw_rectangle(div_x, body_y + 4 - help_scroll, 1, body_content_h - 8, Color::new(45, 50, 65, 150));
+
+            unsafe { raylib::ffi::EndScissorMode(); }
+
+            // Footer
+            let footer_y = help_y + help_h - footer_h;
+            d.draw_rectangle(help_x, footer_y, help_w, footer_h, Color::new(22, 22, 30, 250));
+            d.draw_rectangle(help_x + inner_pad, footer_y, help_w - inner_pad * 2, 1, Color::new(55, 60, 75, 180));
+            let hint_text = if max_help_scroll > 0 { "F1 or Esc to close  \u{2022}  Scroll for more" } else { "F1 or Esc to close" };
+            let hint = std::ffi::CString::new(hint_text).unwrap_or_default();
             unsafe {
                 raylib::ffi::DrawTextEx(
                     mono_font, hint.as_ptr(),
                     raylib::ffi::Vector2 {
                         x: (help_x + inner_pad) as f32,
-                        y: (help_y + help_h - cell_height - inner_pad / 2) as f32,
+                        y: (footer_y + (footer_h - label_size) / 2) as f32,
                     },
                     label_size as f32, 0.0,
                     raylib::ffi::Color { r: 100, g: 100, b: 110, a: 180 },
@@ -1585,10 +2124,12 @@ fn main() {
             let status_h = if sm_status.is_some() { line_h } else { 0 };
             let input_h = if sm_input.is_some() { line_h + 4 } else { 0 };
 
-            let sm_w = 480.min(screen_w - 40);
+            let content_x = wm.sidebar_width();
+            let content_w = screen_w - content_x;
+            let sm_w = 480.min(content_w - 40);
             let sm_h = title_h + inner_pad * 2 + list_h + footer_h + status_h + input_h;
             let sm_h = sm_h.min(screen_h - 40);
-            let sm_x = (screen_w - sm_w) / 2;
+            let sm_x = content_x + (content_w - sm_w) / 2;
             let sm_y = (screen_h - sm_h) / 2;
 
             d.draw_rectangle(sm_x, sm_y, sm_w, sm_h, Color::new(25, 25, 32, 250));
@@ -1722,12 +2263,121 @@ fn main() {
             }
         }
 
+        // SSH connect overlay
+        if show_ssh_connect {
+            let screen_w = d.get_screen_width();
+            let screen_h = d.get_screen_height();
+            d.draw_rectangle(0, 0, screen_w, screen_h, Color::new(0, 0, 0, 160));
+
+            let inner_pad = 16;
+            let line_h = cell_height + 6;
+            let label_size = (font_size - 2).max(8);
+            let title_h = cell_height + 8;
+            let fields_h = line_h * 4 + inner_pad;
+            let error_h = if ssh_error.is_some() { line_h + 4 } else { 0 };
+            let footer_h = line_h;
+
+            let content_x = wm.sidebar_width();
+            let content_w = screen_w - content_x;
+            let box_w = 420.min(content_w - 40);
+            let box_h = title_h + inner_pad * 2 + fields_h + error_h + footer_h;
+            let box_x = content_x + (content_w - box_w) / 2;
+            let box_y = (screen_h - box_h) / 2;
+
+            d.draw_rectangle(box_x, box_y, box_w, box_h, Color::new(25, 25, 32, 250));
+            d.draw_rectangle(box_x, box_y, box_w, 1, Color::new(70, 80, 110, 220));
+            d.draw_rectangle(box_x, box_y + box_h - 1, box_w, 1, Color::new(70, 80, 110, 220));
+            d.draw_rectangle(box_x, box_y, 1, box_h, Color::new(70, 80, 110, 220));
+            d.draw_rectangle(box_x + box_w - 1, box_y, 1, box_h, Color::new(70, 80, 110, 220));
+
+            let title_text = std::ffi::CString::new("SSH Connect").unwrap_or_default();
+            unsafe {
+                raylib::ffi::DrawTextEx(
+                    mono_font, title_text.as_ptr(),
+                    raylib::ffi::Vector2 { x: (box_x + inner_pad) as f32, y: (box_y + inner_pad / 2 + 2) as f32 },
+                    font_size as f32, 0.0,
+                    raylib::ffi::Color { r: 220, g: 225, b: 240, a: 255 },
+                );
+            }
+            d.draw_rectangle(box_x + inner_pad, box_y + title_h, box_w - inner_pad * 2, 1, Color::new(55, 60, 75, 180));
+
+            let fields_y = box_y + title_h + inner_pad;
+            let labels = ["Host:", "Port:", "User:", "Pass:"];
+            let values = [&ssh_host, &ssh_port, &ssh_user, &ssh_password];
+
+            for (i, (label, value)) in labels.iter().zip(values.iter()).enumerate() {
+                let fy = fields_y + i as i32 * line_h;
+                let is_focused = i == ssh_focus;
+
+                if is_focused {
+                    d.draw_rectangle(box_x + inner_pad - 2, fy - 1, box_w - inner_pad * 2 + 4, line_h, Color::new(40, 45, 70, 200));
+                }
+
+                let label_c = std::ffi::CString::new(*label).unwrap_or_default();
+                unsafe {
+                    raylib::ffi::DrawTextEx(
+                        mono_font, label_c.as_ptr(),
+                        raylib::ffi::Vector2 { x: (box_x + inner_pad + 4) as f32, y: fy as f32 },
+                        label_size as f32, 0.0,
+                        raylib::ffi::Color { r: 140, g: 140, b: 150, a: 255 },
+                    );
+                }
+
+                let display_val = if i == 3 {
+                    "\u{2022}".repeat(value.len())
+                } else {
+                    (*value).clone()
+                };
+                let cursor = if is_focused { "_" } else { "" };
+                let val_text = format!("{}{}", display_val, cursor);
+                let val_c = std::ffi::CString::new(val_text).unwrap_or_default();
+                let val_color = if is_focused {
+                    raylib::ffi::Color { r: 255, g: 255, b: 255, a: 255 }
+                } else {
+                    raylib::ffi::Color { r: 180, g: 180, b: 190, a: 255 }
+                };
+                unsafe {
+                    raylib::ffi::DrawTextEx(
+                        mono_font, val_c.as_ptr(),
+                        raylib::ffi::Vector2 { x: (box_x + inner_pad + 60) as f32, y: fy as f32 },
+                        label_size as f32, 0.0,
+                        val_color,
+                    );
+                }
+            }
+
+            if let Some(ref err) = ssh_error {
+                let ey = fields_y + 4 * line_h + 4;
+                let err_c = std::ffi::CString::new(err.as_str()).unwrap_or_default();
+                unsafe {
+                    raylib::ffi::DrawTextEx(
+                        mono_font, err_c.as_ptr(),
+                        raylib::ffi::Vector2 { x: (box_x + inner_pad + 4) as f32, y: ey as f32 },
+                        label_size as f32, 0.0,
+                        raylib::ffi::Color { r: 255, g: 80, b: 80, a: 255 },
+                    );
+                }
+            }
+
+            let footer_y = box_y + box_h - footer_h - inner_pad / 2;
+            let footer_c = std::ffi::CString::new("Enter: Connect  Tab: Next field  Esc: Cancel").unwrap_or_default();
+            unsafe {
+                raylib::ffi::DrawTextEx(
+                    mono_font, footer_c.as_ptr(),
+                    raylib::ffi::Vector2 { x: (box_x + inner_pad) as f32, y: footer_y as f32 },
+                    label_size as f32, 0.0,
+                    raylib::ffi::Color { r: 100, g: 100, b: 110, a: 180 },
+                );
+            }
+        }
+
         // Status bar (global, at bottom)
         status_bar.render(
             &mono_font,
             d.get_screen_width(),
             d.get_screen_height(),
             font_size,
+            wm.sidebar_width(),
             focused_mode,
             &focused_cwd,
             &focused_ai_input,
@@ -1735,12 +2385,176 @@ fn main() {
             panel_info,
             &mut d,
         );
+
+        // Sidebar (draws on top of left edge)
+        let sidebar_w = wm.sidebar_width();
+        if sidebar_w > 0 {
+            let scr_h = d.get_screen_height();
+            let name_size = (font_size - 2).max(8);
+            let info_size = (font_size - 4).max(7);
+            let plus_btn_y = scr_h - SIDEBAR_BUTTON_HEIGHT;
+            let list_area_h = plus_btn_y;
+
+            let max_scroll = (wm.workspaces.len() as i32 * ROW_HEIGHT - list_area_h).max(0);
+            let scroll = wm.sidebar_scroll.min(max_scroll).max(0);
+
+            d.draw_rectangle(0, 0, sidebar_w, scr_h, Color::new(15, 15, 20, 255));
+
+            let mx = d.get_mouse_x();
+            let my = d.get_mouse_y();
+            let mouse_in_sidebar = mx < sidebar_w;
+
+            unsafe { raylib::ffi::BeginScissorMode(0, 0, sidebar_w, list_area_h); }
+
+            for (i, ws) in wm.workspaces.iter().enumerate() {
+                let row_y = i as i32 * ROW_HEIGHT - scroll;
+                if row_y + ROW_HEIGHT < 0 || row_y > list_area_h { continue; }
+
+                let is_active = i == wm.active;
+                let is_hover = mouse_in_sidebar && my >= row_y && my < row_y + ROW_HEIGHT && my < plus_btn_y;
+
+                if is_active {
+                    d.draw_rectangle(0, row_y, sidebar_w - 1, ROW_HEIGHT, Color::new(40, 45, 65, 220));
+                } else if is_hover {
+                    d.draw_rectangle(0, row_y, sidebar_w - 1, ROW_HEIGHT, Color::new(30, 35, 50, 180));
+                }
+
+                let is_renaming = wm.renaming == Some(i);
+                let name_y = row_y + 6;
+                let info_y = row_y + 6 + name_size + 4;
+
+                if is_renaming {
+                    d.draw_rectangle(6, name_y - 1, sidebar_w - 14, name_size + 4, Color::new(30, 35, 55, 255));
+                    d.draw_rectangle_lines(6, name_y - 1, sidebar_w - 14, name_size + 4, Color::new(80, 130, 220, 200));
+
+                    let cursor_text = format!("{}_", &wm.rename_buf);
+                    let rename_c = std::ffi::CString::new(cursor_text.as_str()).unwrap_or_default();
+                    unsafe {
+                        raylib::ffi::DrawTextEx(
+                            mono_font, rename_c.as_ptr(),
+                            raylib::ffi::Vector2 { x: 10.0, y: name_y as f32 },
+                            name_size as f32, 0.0,
+                            raylib::ffi::Color { r: 255, g: 255, b: 255, a: 255 },
+                        );
+                    }
+                } else {
+                    let name_truncated: String = ws.name.chars().take(22).collect();
+                    let name_c = std::ffi::CString::new(name_truncated.as_str()).unwrap_or_default();
+                    unsafe {
+                        raylib::ffi::DrawTextEx(
+                            mono_font, name_c.as_ptr(),
+                            raylib::ffi::Vector2 { x: 10.0, y: name_y as f32 },
+                            name_size as f32, 0.0,
+                            if is_active {
+                                raylib::ffi::Color { r: 220, g: 225, b: 240, a: 255 }
+                            } else {
+                                raylib::ffi::Color { r: 150, g: 155, b: 170, a: 255 }
+                            },
+                        );
+                    }
+                }
+
+                let panels = ws.panel_count();
+                let tabs = ws.total_tab_count();
+                let info_text = if ws.ssh_info.is_some() {
+                    format!("SSH \u{00b7} {} panel{} \u{00b7} {} tab{}", panels, if panels != 1 {"s"} else {""}, tabs, if tabs != 1 {"s"} else {""})
+                } else {
+                    format!("{} panel{} \u{00b7} {} tab{}", panels, if panels != 1 {"s"} else {""}, tabs, if tabs != 1 {"s"} else {""})
+                };
+                let info_c = std::ffi::CString::new(info_text.as_str()).unwrap_or_default();
+                let info_color = if ws.ssh_info.is_some() {
+                    raylib::ffi::Color { r: 70, g: 145, b: 200, a: 200 }
+                } else {
+                    raylib::ffi::Color { r: 100, g: 105, b: 120, a: 200 }
+                };
+                unsafe {
+                    raylib::ffi::DrawTextEx(
+                        mono_font, info_c.as_ptr(),
+                        raylib::ffi::Vector2 { x: 10.0, y: info_y as f32 },
+                        info_size as f32, 0.0,
+                        info_color,
+                    );
+                }
+
+                d.draw_rectangle(4, row_y + ROW_HEIGHT - 1, sidebar_w - 9, 1, Color::new(35, 40, 55, 150));
+            }
+
+            unsafe { raylib::ffi::EndScissorMode(); }
+
+            // '+' button at bottom
+            let plus_hover = mouse_in_sidebar && my >= plus_btn_y;
+            d.draw_rectangle(0, plus_btn_y, sidebar_w - 1, SIDEBAR_BUTTON_HEIGHT, Color::new(20, 22, 30, 255));
+            d.draw_rectangle(0, plus_btn_y, sidebar_w - 1, 1, Color::new(45, 50, 65, 180));
+            if plus_hover {
+                d.draw_rectangle(4, plus_btn_y + 4, sidebar_w - 9, SIDEBAR_BUTTON_HEIGHT - 8, Color::new(40, 50, 70, 200));
+            }
+            let plus_c = std::ffi::CString::new("+  New workspace").unwrap_or_default();
+            unsafe {
+                raylib::ffi::DrawTextEx(
+                    mono_font, plus_c.as_ptr(),
+                    raylib::ffi::Vector2 {
+                        x: 10.0,
+                        y: (plus_btn_y + (SIDEBAR_BUTTON_HEIGHT - name_size) / 2) as f32,
+                    },
+                    name_size as f32, 0.0,
+                    if plus_hover {
+                        raylib::ffi::Color { r: 200, g: 210, b: 230, a: 255 }
+                    } else {
+                        raylib::ffi::Color { r: 120, g: 130, b: 150, a: 220 }
+                    },
+                );
+            }
+
+            d.draw_rectangle(sidebar_w - 1, 0, 1, scr_h, Color::new(55, 60, 75, 180));
+
+            // Context menu
+            if let Some((ctx_idx, cmx, cmy)) = wm.context_menu {
+                if ctx_idx < wm.workspaces.len() {
+                    let cm_w = 140;
+                    let item_h = 28;
+                    let cm_h = item_h * 2;
+                    let cm_y = cmy.min(scr_h - cm_h);
+                    let cm_x = cmx.min(sidebar_w - cm_w);
+
+                    d.draw_rectangle(cm_x, cm_y, cm_w, cm_h, Color::new(30, 32, 42, 245));
+                    d.draw_rectangle_lines(cm_x, cm_y, cm_w, cm_h, Color::new(60, 65, 80, 200));
+
+                    let items: [(&str, bool); 2] = [
+                        ("Rename", true),
+                        ("Close", wm.workspaces.len() > 1),
+                    ];
+
+                    for (j, (label, enabled)) in items.iter().enumerate() {
+                        let iy = cm_y + j as i32 * item_h;
+                        let item_hover = mx >= cm_x && mx < cm_x + cm_w && my >= iy && my < iy + item_h;
+                        if item_hover && *enabled {
+                            d.draw_rectangle(cm_x + 2, iy + 2, cm_w - 4, item_h - 4, Color::new(50, 55, 75, 200));
+                        }
+                        let label_c = std::ffi::CString::new(*label).unwrap_or_default();
+                        let color = if *enabled {
+                            if item_hover { raylib::ffi::Color { r: 230, g: 235, b: 245, a: 255 } }
+                            else { raylib::ffi::Color { r: 180, g: 185, b: 200, a: 255 } }
+                        } else {
+                            raylib::ffi::Color { r: 80, g: 85, b: 100, a: 150 }
+                        };
+                        unsafe {
+                            raylib::ffi::DrawTextEx(
+                                mono_font, label_c.as_ptr(),
+                                raylib::ffi::Vector2 { x: (cm_x + 12) as f32, y: (iy + (item_h - info_size) / 2) as f32 },
+                                info_size as f32, 0.0,
+                                color,
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Save session on exit (all vars still alive, Drop not yet fired)
     let win_pos = unsafe { raylib::ffi::GetWindowPosition() };
     if let Err(e) = session::save(
-        &root, focused_panel_id, next_panel_id, font_size,
+        &wm, font_size,
         rl.get_screen_width(), rl.get_screen_height(),
         win_pos.x as i32, win_pos.y as i32,
     ) {

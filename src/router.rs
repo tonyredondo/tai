@@ -4,7 +4,7 @@ use crate::ai::conversation::ConversationHistory;
 use crate::config::TaiConfig;
 use crate::overlay::CommandOverlay;
 use crate::terminal::engine::Terminal;
-use crate::terminal::pty::Pty;
+use crate::terminal::backend::Backend;
 use async_openai::types::ChatCompletionMessageToolCall;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -141,7 +141,7 @@ impl InputRouter {
         }
     }
 
-    pub fn handle_ai_prompt_submit(&mut self, terminal: &mut Terminal, pty: &Pty) {
+    pub fn handle_ai_prompt_submit(&mut self, terminal: &mut Terminal, backend: &mut Backend) {
         if self.mode != InputMode::AiPrompt || self.ai_input_buffer.is_empty() {
             return;
         }
@@ -166,7 +166,7 @@ impl InputRouter {
         terminal.vt_write(prompt_display.as_bytes());
 
         let buffer_text = terminal.get_buffer_text(self.config.ai.max_context_lines);
-        let cwd = pty.get_cwd().unwrap_or_else(|| PathBuf::from("~"));
+        let cwd = backend.get_cwd().unwrap_or_else(|| PathBuf::from("~"));
         let os = std::env::consts::OS;
         let arch = std::env::consts::ARCH;
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string());
@@ -239,12 +239,12 @@ impl InputRouter {
         }
     }
 
-    pub fn poll_ai_responses(&mut self, terminal: &mut Terminal, pty: &Pty, overlay: &mut CommandOverlay) {
+    pub fn poll_ai_responses(&mut self, terminal: &mut Terminal, backend: &mut Backend, overlay: &mut CommandOverlay) {
         let should_finish_timeout = self.command_capture.as_ref()
             .is_some_and(|c| c.active && c.timeout.elapsed().as_secs() > 30);
 
         if should_finish_timeout {
-            self.finish_command_capture(terminal, pty);
+            self.finish_command_capture(terminal, backend);
         }
 
         let has_end_marker = self.command_capture.as_ref().is_some_and(|c| {
@@ -259,19 +259,19 @@ impl InputRouter {
             if let Some(ref c) = self.command_capture {
                 eprintln!("[TAI] End marker found for tool_call_id={}", c.tool_call_id);
             }
-            self.finish_command_capture(terminal, pty);
+            self.finish_command_capture(terminal, backend);
         }
 
         if self.has_pending_dispatch && self.command_capture.is_none() {
             self.has_pending_dispatch = false;
             if !self.tool_call_queue.is_empty() {
                 eprintln!("[TAI] Dispatching next queued tool call ({} remaining)", self.tool_call_queue.len());
-                self.dispatch_next_tool_call(terminal, pty, overlay);
+                self.dispatch_next_tool_call(terminal, backend, overlay);
                 return;
             }
             eprintln!("[TAI] Queue empty, sending AI request (conversation has {} msgs)", self.conversation.len());
             if let Some(ref bridge) = self.ai_bridge {
-                let cwd = pty.get_cwd().unwrap_or_else(|| PathBuf::from("~"));
+                let cwd = backend.get_cwd().unwrap_or_else(|| PathBuf::from("~"));
                 let os = std::env::consts::OS;
                 let arch = std::env::consts::ARCH;
                 let shell = std::env::var("SHELL").unwrap_or_else(|_| "unknown".to_string());
@@ -355,7 +355,7 @@ impl InputRouter {
                             }
                         }
 
-                        self.dispatch_next_tool_call(terminal, pty, overlay);
+                        self.dispatch_next_tool_call(terminal, backend, overlay);
                         continue;
                     }
 
@@ -369,7 +369,7 @@ impl InputRouter {
                     }
                     if self.mode == InputMode::AiStreaming {
                         terminal.vt_write(b"\x1b[0m");
-                        pty.write(b"\n");
+                        backend.write(b"\n");
                         self.mode = InputMode::Shell;
                     }
                 }
@@ -378,7 +378,7 @@ impl InputRouter {
                     let msg = format!("\r\n\x1b[31mTAI Error: {}\x1b[0m\r\n", err);
                     terminal.vt_write(msg.as_bytes());
                     self.conversation.remove_trailing_orphans();
-                    pty.write(b"\n");
+                    backend.write(b"\n");
                     self.mode = InputMode::Shell;
                 }
             }
@@ -388,18 +388,18 @@ impl InputRouter {
     pub fn handle_command_confirm_enter(
         &mut self,
         terminal: &mut Terminal,
-        pty: &Pty,
+        backend: &mut Backend,
         overlay: &mut CommandOverlay,
     ) {
         if let Some(pending) = self.pending_command.take() {
             overlay.hide();
-            self.execute_command(&pending.command, &pending.tool_call_id, terminal, pty);
+            self.execute_command(&pending.command, &pending.tool_call_id, terminal, backend);
         }
     }
 
     pub fn handle_command_confirm_cancel(
         &mut self,
-        pty: &Pty,
+        backend: &mut Backend,
         overlay: &mut CommandOverlay,
     ) {
         if let Some(pending) = self.pending_command.take() {
@@ -407,19 +407,19 @@ impl InputRouter {
             self.conversation.push_tool_result(&pending.tool_call_id, "User cancelled the command.");
             self.tool_call_queue.clear();
             self.pending_tool_calls.clear();
-            pty.write(b"\n");
+            backend.write(b"\n");
             self.mode = InputMode::Shell;
         }
     }
 
     pub fn handle_command_confirm_edit(
         &mut self,
-        pty: &Pty,
+        backend: &mut Backend,
         overlay: &mut CommandOverlay,
     ) {
         if let Some(pending) = self.pending_command.take() {
             overlay.hide();
-            pty.write(pending.command.as_bytes());
+            backend.write(pending.command.as_bytes());
             self.conversation.push_tool_result(&pending.tool_call_id, "User chose to edit the command manually.");
             self.tool_call_queue.clear();
             self.pending_tool_calls.clear();
@@ -488,7 +488,7 @@ impl InputRouter {
     fn dispatch_next_tool_call(
         &mut self,
         terminal: &mut Terminal,
-        pty: &Pty,
+        backend: &mut Backend,
         overlay: &mut CommandOverlay,
     ) {
         if self.tool_call_queue.is_empty() {
@@ -498,7 +498,7 @@ impl InputRouter {
         let tc = self.tool_call_queue.remove(0);
 
         if self.config.ai.auto_execute {
-            self.execute_command(&tc.command, &tc.id, terminal, pty);
+            self.execute_command(&tc.command, &tc.id, terminal, backend);
         } else {
             self.pending_command = Some(PendingCommand {
                 command: tc.command,
@@ -518,7 +518,7 @@ impl InputRouter {
         command: &str,
         tool_call_id: &str,
         terminal: &mut Terminal,
-        pty: &Pty,
+        backend: &mut Backend,
     ) {
         let uuid = Uuid::new_v4().to_string()[..8].to_string();
         let start_marker = format!("TAI_S_{uuid}");
@@ -549,22 +549,22 @@ impl InputRouter {
         });
 
         let source_cmd = format!(" . {}\n", tmp_path);
-        pty.set_echo(false);
-        pty.write(source_cmd.as_bytes());
+        backend.set_echo(false);
+        backend.write(source_cmd.as_bytes());
         self.mode = InputMode::AiStreaming;
     }
 
     fn finish_command_capture(
         &mut self,
         _terminal: &mut Terminal,
-        pty: &Pty,
+        backend: &mut Backend,
     ) {
         let capture = match self.command_capture.take() {
             Some(c) => c,
             None => return,
         };
 
-        pty.set_echo(true);
+        backend.set_echo(true);
 
         let raw = String::from_utf8_lossy(&capture.raw_output);
         let mut output = String::new();

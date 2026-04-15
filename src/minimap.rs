@@ -198,6 +198,8 @@ impl Minimap {
                             self.parse_sgr();
                         } else if b == b'h' || b == b'l' {
                             self.parse_mode_set(b);
+                        } else if b == b'J' {
+                            self.parse_erase_display();
                         }
                         self.state = ParserState::Normal;
                     } else {
@@ -311,6 +313,22 @@ impl Minimap {
                 _ => {}
             }
             i += 1;
+        }
+    }
+
+    fn parse_erase_display(&mut self) {
+        let param: u16 = std::str::from_utf8(&self.escape_buf)
+            .unwrap_or("0")
+            .trim()
+            .parse()
+            .unwrap_or(0);
+        if param == 2 || param == 3 {
+            self.lines.clear();
+            self.pixel_cache.clear();
+            self.pixel_cache_dirty = true;
+            self.last_cache_line_count = 0;
+            self.current_line_chars = 0;
+            self.max_line_chars = 0;
         }
     }
 

@@ -73,41 +73,45 @@ impl TabBar {
         d.draw_rectangle(offset_x, offset_y, bar_width, h, Color::new(22, 22, 28, 255));
 
         let tab_count = titles.len();
-        let tab_w = self.tab_width(tab_count, bar_width);
+        let left_pad = 4;
+        let tab_w = self.tab_width(tab_count, bar_width - left_pad);
         let label_size = (font_size - 2).max(8);
 
-        let active_x = offset_x + active as i32 * tab_w;
+        let top_pad = 2;
+        let tab_y = offset_y + top_pad;
+        let tab_h = h - top_pad;
+        let tabs_x = offset_x + left_pad;
+        let active_x = tabs_x + active as i32 * tab_w;
 
         for (i, title) in titles.iter().enumerate() {
-            let x = offset_x + i as i32 * tab_w;
+            let x = tabs_x + i as i32 * tab_w;
             let is_active = i == active;
 
             if is_active {
-                let radius = 6;
+                let radius = 8;
                 let tab_bg = Color::new(26, 27, 30, 255);
-                // Draw rounded tab extending past bottom so only top corners are rounded
-                let extended_h = h + radius * 2;
+                let extended_h = tab_h + radius * 2;
+                let roundness = (radius as f32 * 2.0) / (extended_h as f32).min(tab_w as f32);
                 let rect = raylib::ffi::Rectangle {
                     x: x as f32,
-                    y: offset_y as f32,
+                    y: tab_y as f32,
                     width: tab_w as f32,
                     height: extended_h as f32,
                 };
                 unsafe {
-                    raylib::ffi::BeginScissorMode(x, offset_y, tab_w, h);
-                    raylib::ffi::DrawRectangleRounded(rect, 0.15, 8, accent.into());
+                    raylib::ffi::BeginScissorMode(x, tab_y, tab_w, tab_h);
+                    raylib::ffi::DrawRectangleRounded(rect, roundness, 12, accent.into());
                     let inner_rect = raylib::ffi::Rectangle {
                         x: (x + 1) as f32,
-                        y: (offset_y + 1) as f32,
+                        y: (tab_y + 1) as f32,
                         width: (tab_w - 2) as f32,
                         height: (extended_h - 1) as f32,
                     };
-                    raylib::ffi::DrawRectangleRounded(inner_rect, 0.15, 8, tab_bg.into());
+                    raylib::ffi::DrawRectangleRounded(inner_rect, roundness, 12, tab_bg.into());
                     raylib::ffi::EndScissorMode();
                 }
             } else {
-                d.draw_rectangle(x, offset_y, tab_w, h, Color::new(22, 22, 28, 255));
-                d.draw_rectangle(x + tab_w - 1, offset_y + 4, 1, h - 8, Color::new(45, 45, 55, 150));
+                d.draw_rectangle(x + tab_w - 1, tab_y + 4, 1, tab_h - 8, Color::new(45, 45, 55, 150));
             }
 
             let max_chars = ((tab_w - self.height - 14) / (label_size / 2 + 1)).max(1) as usize;
@@ -130,7 +134,7 @@ impl TabBar {
                     c_label.as_ptr(),
                     raylib::ffi::Vector2 {
                         x: (x + 14) as f32,
-                        y: (offset_y + (h - label_size) / 2) as f32,
+                        y: (tab_y + (tab_h - label_size) / 2) as f32,
                     },
                     label_size as f32,
                     0.0,
@@ -139,7 +143,7 @@ impl TabBar {
             }
 
             let close_x = x + tab_w - self.height;
-            let close_y = offset_y + (h - label_size) / 2;
+            let close_y = tab_y + (tab_h - label_size) / 2;
             let close_color = if is_active {
                 raylib::ffi::Color { r: 160, g: 160, b: 170, a: 180 }
             } else {
@@ -172,7 +176,7 @@ impl TabBar {
             d.draw_rectangle(active_end, bottom_y, bar_end - active_end, 1, border_line);
         }
 
-        let plus_x = offset_x + tab_count as i32 * tab_w;
+        let plus_x = tabs_x + tab_count as i32 * tab_w;
         let c_plus = std::ffi::CString::new("+").unwrap_or_default();
         unsafe {
             raylib::ffi::DrawTextEx(
@@ -180,7 +184,7 @@ impl TabBar {
                 c_plus.as_ptr(),
                 raylib::ffi::Vector2 {
                     x: (plus_x + 10) as f32,
-                    y: (offset_y + (h - label_size) / 2) as f32,
+                    y: (tab_y + (tab_h - label_size) / 2) as f32,
                 },
                 label_size as f32,
                 0.0,

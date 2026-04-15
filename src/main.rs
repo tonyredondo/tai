@@ -25,7 +25,7 @@ use split::{SplitDirection, SplitNode, PanelRect, alloc_panel_id, create_panel, 
 use status_bar::StatusBar;
 use tab::TabSession;
 use tab_bar::TabBarAction;
-use workspace::{Workspace, WorkspaceManager, SIDEBAR_WIDTH, ROW_HEIGHT, SIDEBAR_BUTTON_HEIGHT};
+use workspace::{Workspace, WorkspaceManager, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH, ROW_HEIGHT, SIDEBAR_BUTTON_HEIGHT};
 use raylib::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -499,7 +499,7 @@ fn main() {
 
     // --- Restore session or create fresh ---
     let mut wm = if let Some(state) = loaded_session {
-        let initial_sidebar_w = if state.sidebar_visible { SIDEBAR_WIDTH } else { 0 };
+        let initial_sidebar_w = if state.sidebar_visible { state.sidebar_width_px } else { 0 };
         match session::restore(
             state,
             &config,
@@ -549,6 +549,7 @@ fn main() {
 
     let mut sidebar_last_click: Option<(usize, Instant)> = None;
     let mut separator_drag: Option<split::SeparatorHit> = None;
+    let mut sidebar_drag: bool = false;
 
     let mut show_ssh_connect = false;
     let mut ssh_host = String::new();
@@ -823,7 +824,7 @@ fn main() {
                                 status_bar_height = font_size + 8;
                             }
 
-                            let load_sidebar_w = if state.sidebar_visible { SIDEBAR_WIDTH } else { 0 };
+                            let load_sidebar_w = if state.sidebar_visible { state.sidebar_width_px } else { 0 };
 
                             let scr_w = rl.get_screen_width();
                             let scr_h = rl.get_screen_height();
@@ -1140,7 +1141,7 @@ fn main() {
         } else if cmd_held && !shift_held && !ctrl_held && rl.is_key_pressed(KeyboardKey::KEY_N) {
             // New local workspace
             let name = wm.next_name();
-            let future_sidebar_w = if wm.sidebar_visible { SIDEBAR_WIDTH } else { 0 };
+            let future_sidebar_w = wm.sidebar_width();
             let scr_w = rl.get_screen_width();
             let scr_h = rl.get_screen_height();
             let (root, fid, nid) = create_fresh_panel(&config, scr_w, scr_h, status_bar_height, future_sidebar_w, pad, minimap_width, cell_width, cell_height);
@@ -1364,8 +1365,30 @@ fn main() {
                     let my = rl.get_mouse_y();
                     let sidebar_w = wm.sidebar_width();
 
-                    // Sidebar mouse handling
-                    if sidebar_w > 0 && mx < sidebar_w {
+                    // Sidebar resize drag handling (checked first so edge grabs aren't swallowed)
+                    let sidebar_edge_hit = 4;
+                    if sidebar_drag {
+                        if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) {
+                            let new_w = mx.max(SIDEBAR_MIN_WIDTH).min(SIDEBAR_MAX_WIDTH);
+                            if new_w != wm.sidebar_width_px {
+                                wm.sidebar_width_px = new_w;
+                                let sw2 = wm.sidebar_width();
+                                let scr_w = rl.get_screen_width();
+                                let scr_h = rl.get_screen_height();
+                                relayout_and_resize(&mut wm.active_mut().root, scr_w, scr_h, status_bar_height, sw2, pad, minimap_width, cell_width, cell_height);
+                            }
+                        } else {
+                            sidebar_drag = false;
+                        }
+                    } else if wm.sidebar_visible && rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
+                        let sw = wm.sidebar_width_px;
+                        if mx >= sw - sidebar_edge_hit && mx <= sw + sidebar_edge_hit {
+                            sidebar_drag = true;
+                        }
+                    }
+
+                    // Sidebar mouse handling (skip when dragging the sidebar edge)
+                    if !sidebar_drag && sidebar_w > 0 && mx < sidebar_w {
                         let wheel = unsafe { raylib::ffi::GetMouseWheelMove() } as i32;
                         if wheel != 0 {
                             let scr_h = rl.get_screen_height();
@@ -1417,7 +1440,7 @@ fn main() {
                             if my >= plus_btn_y {
                                 // '+' button clicked — create new workspace
                                 let name = wm.next_name();
-                                let future_sidebar_w = if wm.sidebar_visible { SIDEBAR_WIDTH } else { 0 };
+                                let future_sidebar_w = wm.sidebar_width();
                                 let scr_w = rl.get_screen_width();
                                 let (root, fid, nid) = create_fresh_panel(&config, scr_w, scr_h, status_bar_height, future_sidebar_w, pad, minimap_width, cell_width, cell_height);
                                 wm.add(Workspace {
@@ -1501,8 +1524,13 @@ fn main() {
                         }
                     }
 
-                    // Set cursor for separator hover/drag
-                    if let Some(hit) = separator_drag {
+                    // Set cursor for sidebar edge / separator hover/drag
+                    if sidebar_drag || (wm.sidebar_visible && !separator_drag.is_some() && {
+                        let sw = wm.sidebar_width_px;
+                        mx >= sw - sidebar_edge_hit && mx <= sw + sidebar_edge_hit
+                    }) {
+                        unsafe { raylib::ffi::SetMouseCursor(raylib::ffi::MouseCursor::MOUSE_CURSOR_RESIZE_EW as i32); }
+                    } else if let Some(hit) = separator_drag {
                         match hit.direction {
                             split::SplitDirection::Horizontal => unsafe { raylib::ffi::SetMouseCursor(raylib::ffi::MouseCursor::MOUSE_CURSOR_RESIZE_EW as i32); },
                             split::SplitDirection::Vertical => unsafe { raylib::ffi::SetMouseCursor(raylib::ffi::MouseCursor::MOUSE_CURSOR_RESIZE_NS as i32); },
@@ -1525,7 +1553,7 @@ fn main() {
                         }
                     });
 
-                    let hover_panel_id = if separator_drag.is_some() {
+                    let hover_panel_id = if sidebar_drag || separator_drag.is_some() {
                         None
                     } else if let Some(drag_id) = dragging_panel_id {
                         Some(drag_id)

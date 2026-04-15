@@ -54,6 +54,8 @@ pub struct SessionState {
     pub active_workspace: usize,
     #[serde(default = "default_true")]
     pub sidebar_visible: bool,
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width_px: i32,
     #[serde(default)]
     pub workspaces: Vec<SessionWorkspace>,
     // v1 compat fields (kept for deserialization, skipped on v2 serialize)
@@ -74,6 +76,7 @@ pub struct SessionState {
 }
 
 fn default_true() -> bool { true }
+fn default_sidebar_width() -> i32 { crate::workspace::SIDEBAR_DEFAULT_WIDTH }
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -198,6 +201,7 @@ pub fn save(
         window_y,
         active_workspace: wm.active,
         sidebar_visible: wm.sidebar_visible,
+        sidebar_width_px: wm.sidebar_width_px,
         workspaces,
         focused_panel_id: None,
         next_panel_id: None,
@@ -554,6 +558,7 @@ pub fn restore(
         workspaces,
         state.active_workspace,
         state.sidebar_visible,
+        state.sidebar_width_px,
         next_id,
     );
 

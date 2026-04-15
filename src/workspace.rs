@@ -1,7 +1,9 @@
 use crate::split::SplitNode;
 use crate::terminal::ssh::SshTabInfo;
 
-pub const SIDEBAR_WIDTH: i32 = 200;
+pub const SIDEBAR_DEFAULT_WIDTH: i32 = 200;
+pub const SIDEBAR_MIN_WIDTH: i32 = 120;
+pub const SIDEBAR_MAX_WIDTH: i32 = 400;
 pub const ROW_HEIGHT: i32 = 56;
 pub const SIDEBAR_BUTTON_HEIGHT: i32 = 36;
 
@@ -33,6 +35,7 @@ pub struct WorkspaceManager {
     pub active: usize,
     pub sidebar_visible: bool,
     pub sidebar_scroll: i32,
+    pub sidebar_width_px: i32,
     next_workspace_id: u32,
     pub renaming: Option<usize>,
     pub rename_buf: String,
@@ -46,6 +49,7 @@ impl WorkspaceManager {
             active: 0,
             sidebar_visible: true,
             sidebar_scroll: 0,
+            sidebar_width_px: SIDEBAR_DEFAULT_WIDTH,
             next_workspace_id: 1,
             renaming: None,
             rename_buf: String::new(),
@@ -62,7 +66,7 @@ impl WorkspaceManager {
     }
 
     pub fn sidebar_width(&self) -> i32 {
-        if self.sidebar_visible { SIDEBAR_WIDTH } else { 0 }
+        if self.sidebar_visible { self.sidebar_width_px } else { 0 }
     }
 
     pub fn next_name(&mut self) -> String {
@@ -111,6 +115,7 @@ impl WorkspaceManager {
         workspaces: Vec<Workspace>,
         active: usize,
         sidebar_visible: bool,
+        sidebar_width_px: i32,
         next_workspace_id: u32,
     ) -> Self {
         Self {
@@ -118,6 +123,7 @@ impl WorkspaceManager {
             workspaces,
             sidebar_visible,
             sidebar_scroll: 0,
+            sidebar_width_px: sidebar_width_px.max(SIDEBAR_MIN_WIDTH).min(SIDEBAR_MAX_WIDTH),
             next_workspace_id,
             renaming: None,
             rename_buf: String::new(),

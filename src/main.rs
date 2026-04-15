@@ -532,6 +532,7 @@ fn main() {
     let mut last_autosave = Instant::now();
 
     let mut sidebar_last_click: Option<(usize, Instant)> = None;
+    let mut separator_drag: Option<split::SeparatorHit> = None;
 
     let mut show_ssh_connect = false;
     let mut ssh_host = String::new();
@@ -1459,6 +1460,46 @@ fn main() {
                             }
                         }
 
+                    // Separator drag handling (resize splits)
+                    if let Some(hit) = separator_drag {
+                        if rl.is_mouse_button_down(MouseButton::MOUSE_BUTTON_LEFT) {
+                            let pos = match hit.direction {
+                                split::SplitDirection::Horizontal => mx,
+                                split::SplitDirection::Vertical => my,
+                            };
+                            let available = hit.total - split::SEPARATOR_PX;
+                            if available > 0 {
+                                let new_ratio = (pos - hit.origin) as f32 / available as f32;
+                                wm.active_mut().root.update_ratio_by_ptr(hit.node_ptr, new_ratio);
+                                let sidebar_w = wm.sidebar_width();
+                                let scr_w = rl.get_screen_width();
+                                let scr_h = rl.get_screen_height();
+                                relayout_and_resize(&mut wm.active_mut().root, scr_w, scr_h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
+                            }
+                        } else {
+                            separator_drag = None;
+                        }
+                    } else if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT) {
+                        if let Some(hit) = wm.active().root.separator_at(mx, my) {
+                            separator_drag = Some(hit);
+                        }
+                    }
+
+                    // Set cursor for separator hover/drag
+                    if let Some(hit) = separator_drag {
+                        match hit.direction {
+                            split::SplitDirection::Horizontal => unsafe { raylib::ffi::SetMouseCursor(raylib::ffi::MouseCursor::MOUSE_CURSOR_RESIZE_EW as i32); },
+                            split::SplitDirection::Vertical => unsafe { raylib::ffi::SetMouseCursor(raylib::ffi::MouseCursor::MOUSE_CURSOR_RESIZE_NS as i32); },
+                        }
+                    } else if let Some(hit) = wm.active().root.separator_at(mx, my) {
+                        match hit.direction {
+                            split::SplitDirection::Horizontal => unsafe { raylib::ffi::SetMouseCursor(raylib::ffi::MouseCursor::MOUSE_CURSOR_RESIZE_EW as i32); },
+                            split::SplitDirection::Vertical => unsafe { raylib::ffi::SetMouseCursor(raylib::ffi::MouseCursor::MOUSE_CURSOR_RESIZE_NS as i32); },
+                        }
+                    } else {
+                        unsafe { raylib::ffi::SetMouseCursor(raylib::ffi::MouseCursor::MOUSE_CURSOR_DEFAULT as i32); }
+                    }
+
                     // Check if any panel's minimap is being dragged
                     let mut dragging_panel_id: Option<u32> = None;
                     wm.active().root.for_each_panel(&mut |panel| {
@@ -1468,7 +1509,9 @@ fn main() {
                         }
                     });
 
-                    let hover_panel_id = if let Some(drag_id) = dragging_panel_id {
+                    let hover_panel_id = if separator_drag.is_some() {
+                        None
+                    } else if let Some(drag_id) = dragging_panel_id {
                         Some(drag_id)
                     } else {
                         wm.active_mut().root.find_panel_at(mx, my).map(|p| p.id)

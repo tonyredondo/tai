@@ -52,9 +52,18 @@ impl Panel {
     }
 }
 
-const SEPARATOR_PX: i32 = 2;
+pub const SEPARATOR_PX: i32 = 2;
+const SEPARATOR_HIT_PX: i32 = 6;
 const MIN_PANEL_W: i32 = 80;
 const MIN_PANEL_H: i32 = 60;
+
+#[derive(Clone, Copy, Debug)]
+pub struct SeparatorHit {
+    pub direction: SplitDirection,
+    pub origin: i32,
+    pub total: i32,
+    pub node_ptr: usize,
+}
 
 pub enum SplitNode {
     Leaf(Panel),
@@ -255,6 +264,61 @@ impl SplitNode {
                 left.close_panel(panel_id) || right.close_panel(panel_id)
             }
         }
+    }
+
+    pub fn separator_at(&self, mx: i32, my: i32) -> Option<SeparatorHit> {
+        match self {
+            SplitNode::Leaf(_) => None,
+            SplitNode::Split { direction, left, right, .. } => {
+                match direction {
+                    SplitDirection::Horizontal => {
+                        let sep_x = get_right_edge(left);
+                        let (sy, sh) = get_vertical_span(self);
+                        if mx >= sep_x - SEPARATOR_HIT_PX && mx <= sep_x + SEPARATOR_PX + SEPARATOR_HIT_PX
+                            && my >= sy && my < sy + sh
+                        {
+                            let (sx, sw) = get_horizontal_span(self);
+                            return Some(SeparatorHit {
+                                direction: *direction,
+                                origin: sx,
+                                total: sw,
+                                node_ptr: self as *const SplitNode as usize,
+                            });
+                        }
+                    }
+                    SplitDirection::Vertical => {
+                        let sep_y = get_bottom_edge(left);
+                        let (sx, sw) = get_horizontal_span(self);
+                        if my >= sep_y - SEPARATOR_HIT_PX && my <= sep_y + SEPARATOR_PX + SEPARATOR_HIT_PX
+                            && mx >= sx && mx < sx + sw
+                        {
+                            let (sy, sh) = get_vertical_span(self);
+                            return Some(SeparatorHit {
+                                direction: *direction,
+                                origin: sy,
+                                total: sh,
+                                node_ptr: self as *const SplitNode as usize,
+                            });
+                        }
+                    }
+                }
+                left.separator_at(mx, my).or_else(|| right.separator_at(mx, my))
+            }
+        }
+    }
+
+    pub fn update_ratio_by_ptr(&mut self, node_ptr: usize, new_ratio: f32) -> bool {
+        if std::ptr::eq(self, node_ptr as *const SplitNode) {
+            if let SplitNode::Split { ratio, .. } = self {
+                *ratio = new_ratio.clamp(0.1, 0.9);
+                return true;
+            }
+        }
+        if let SplitNode::Split { left, right, .. } = self {
+            if left.update_ratio_by_ptr(node_ptr, new_ratio) { return true; }
+            if right.update_ratio_by_ptr(node_ptr, new_ratio) { return true; }
+        }
+        false
     }
 
     pub fn draw_separators(&self, d: &mut raylib::prelude::RaylibDrawHandle) {

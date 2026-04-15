@@ -43,6 +43,10 @@ impl Backend {
         matches!(self, Backend::Local(_))
     }
 
+    pub fn is_ssh(&self) -> bool {
+        matches!(self, Backend::Ssh(_))
+    }
+
     pub fn read_nonblocking(
         &mut self,
         terminal: &mut Terminal,

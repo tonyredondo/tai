@@ -527,30 +527,41 @@ impl InputRouter {
         let cmd_display = format!("\r\n\x1b[1;33m$ {}\x1b[0m", command);
         terminal.vt_write(cmd_display.as_bytes());
 
-        let script = format!(
-            "printf '\\e[8m{start_marker}\\n\\e[28m'\n\
-             {command}\n\
-             __tai_ec=$?\n\
-             printf '\\e[8m'\n\
-             echo '{end_marker}'\"$__tai_ec\"\n\
-             printf '\\e[28m'\n\
-             rm -f /tmp/tai_cmd_{uuid}\n"
-        );
-        let tmp_path = format!("/tmp/tai_cmd_{uuid}");
-        let _ = std::fs::write(&tmp_path, &script);
-
         self.command_capture = Some(CommandCapture {
-            start_marker,
-            end_marker,
+            start_marker: start_marker.clone(),
+            end_marker: end_marker.clone(),
             active: true,
             timeout: Instant::now(),
             tool_call_id: tool_call_id.to_string(),
             raw_output: Vec::new(),
         });
 
-        let source_cmd = format!(" . {}\n", tmp_path);
-        backend.set_echo(false);
-        backend.write(source_cmd.as_bytes());
+        if backend.is_ssh() {
+            let inline = format!(
+                " printf '\\033[8m{start_marker}\\n\\033[28m'; \
+                 {command}; \
+                 __tai_ec=$?; \
+                 printf '\\033[8m'; \
+                 echo '{end_marker}'\"$__tai_ec\"; \
+                 printf '\\033[28m'\n"
+            );
+            backend.write(inline.as_bytes());
+        } else {
+            let script = format!(
+                "printf '\\e[8m{start_marker}\\n\\e[28m'\n\
+                 {command}\n\
+                 __tai_ec=$?\n\
+                 printf '\\e[8m'\n\
+                 echo '{end_marker}'\"$__tai_ec\"\n\
+                 printf '\\e[28m'\n\
+                 rm -f /tmp/tai_cmd_{uuid}\n"
+            );
+            let tmp_path = format!("/tmp/tai_cmd_{uuid}");
+            let _ = std::fs::write(&tmp_path, &script);
+            let source_cmd = format!(" . {}\n", tmp_path);
+            backend.set_echo(false);
+            backend.write(source_cmd.as_bytes());
+        }
         self.mode = InputMode::AiStreaming;
     }
 

@@ -58,7 +58,7 @@ impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
             font_size: 16,
-            scrollback: 100000,
+            scrollback: 10000000,
         }
     }
 }

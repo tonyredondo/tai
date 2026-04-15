@@ -1938,13 +1938,26 @@ fn main() {
             let inner_pad = 12;
             let label_h = cell_height + 4;
 
-            let lines: Vec<&str> = focused_ai_input.split('\n').collect();
-            let line_count = lines.len().max(1) as i32;
+            let text_area_w = ai_panel_w - inner_pad * 2;
+            let chars_per_line = (text_area_w / cell_width).max(1) as usize;
+
+            let mut wrapped_lines: Vec<String> = Vec::new();
+            for logical_line in focused_ai_input.split('\n') {
+                if logical_line.is_empty() {
+                    wrapped_lines.push(String::new());
+                } else {
+                    let chars: Vec<char> = logical_line.chars().collect();
+                    for chunk in chars.chunks(chars_per_line) {
+                        wrapped_lines.push(chunk.iter().collect());
+                    }
+                }
+            }
+
+            let line_count = wrapped_lines.len().max(1) as i32;
             let text_h = line_count * cell_height;
             let ai_panel_h = label_h + text_h + inner_pad * 2 + 4;
             let ai_panel_y = pr.y + pr.h - ai_panel_h - 8;
 
-            // Dim overlay over full window
             d.draw_rectangle(0, 0, screen_w, screen_h, Color::new(0, 0, 0, 100));
 
             d.draw_rectangle(ai_panel_x, ai_panel_y, ai_panel_w, ai_panel_h, Color::new(30, 30, 38, 245));
@@ -1971,7 +1984,7 @@ fn main() {
             d.draw_rectangle(
                 ai_panel_x + inner_pad,
                 ai_panel_y + label_h,
-                ai_panel_w - inner_pad * 2,
+                text_area_w,
                 1,
                 Color::new(55, 60, 75, 180),
             );
@@ -1980,9 +1993,9 @@ fn main() {
             let text_x = ai_panel_x + inner_pad;
 
             let blink_on = (d.get_time() * 2.0) as i32 % 2 == 0;
-            for (i, line) in lines.iter().enumerate() {
-                let cursor_str = if i == lines.len() - 1 && blink_on { "|" } else { "" };
-                let display = format!("{}{}", line, cursor_str);
+            for (i, wline) in wrapped_lines.iter().enumerate() {
+                let cursor_str = if i == wrapped_lines.len() - 1 && blink_on { "|" } else { "" };
+                let display = format!("{}{}", wline, cursor_str);
                 let c_text = std::ffi::CString::new(display.as_str()).unwrap_or_default();
                 unsafe {
                     raylib::ffi::DrawTextEx(

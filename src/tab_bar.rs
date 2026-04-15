@@ -67,29 +67,48 @@ impl TabBar {
         d: &mut RaylibDrawHandle,
     ) {
         let h = self.height;
+        let accent = Color::new(58, 62, 78, 255);
+        let border_line = Color::new(58, 62, 78, 255);
+
         d.draw_rectangle(offset_x, offset_y, bar_width, h, Color::new(22, 22, 28, 255));
-        d.draw_rectangle(offset_x, offset_y + h - 1, bar_width, 1, Color::new(45, 45, 55, 255));
 
         let tab_count = titles.len();
         let tab_w = self.tab_width(tab_count, bar_width);
         let label_size = (font_size - 2).max(8);
 
+        let active_x = offset_x + active as i32 * tab_w;
+
         for (i, title) in titles.iter().enumerate() {
             let x = offset_x + i as i32 * tab_w;
             let is_active = i == active;
 
-            let bg = if is_active {
-                Color::new(38, 38, 48, 255)
-            } else {
-                Color::new(26, 26, 32, 255)
-            };
-            d.draw_rectangle(x, offset_y, tab_w, h, bg);
-
             if is_active {
-                d.draw_rectangle(x, offset_y + h - 2, tab_w, 2, Color::new(80, 140, 220, 255));
+                let radius = 6;
+                let tab_bg = Color::new(26, 27, 30, 255);
+                // Draw rounded tab extending past bottom so only top corners are rounded
+                let extended_h = h + radius * 2;
+                let rect = raylib::ffi::Rectangle {
+                    x: x as f32,
+                    y: offset_y as f32,
+                    width: tab_w as f32,
+                    height: extended_h as f32,
+                };
+                unsafe {
+                    raylib::ffi::BeginScissorMode(x, offset_y, tab_w, h);
+                    raylib::ffi::DrawRectangleRounded(rect, 0.15, 8, accent.into());
+                    let inner_rect = raylib::ffi::Rectangle {
+                        x: (x + 1) as f32,
+                        y: (offset_y + 1) as f32,
+                        width: (tab_w - 2) as f32,
+                        height: (extended_h - 1) as f32,
+                    };
+                    raylib::ffi::DrawRectangleRounded(inner_rect, 0.15, 8, tab_bg.into());
+                    raylib::ffi::EndScissorMode();
+                }
+            } else {
+                d.draw_rectangle(x, offset_y, tab_w, h, Color::new(22, 22, 28, 255));
+                d.draw_rectangle(x + tab_w - 1, offset_y + 4, 1, h - 8, Color::new(45, 45, 55, 150));
             }
-
-            d.draw_rectangle(x + tab_w - 1, offset_y + 2, 1, h - 4, Color::new(45, 45, 55, 200));
 
             let max_chars = ((tab_w - self.height - 14) / (label_size / 2 + 1)).max(1) as usize;
             let label: String = if title.len() > max_chars {
@@ -140,6 +159,17 @@ impl TabBar {
                     close_color,
                 );
             }
+        }
+
+        // Bottom border line with gap for active tab
+        let bottom_y = offset_y + h - 1;
+        if active_x > offset_x {
+            d.draw_rectangle(offset_x, bottom_y, active_x - offset_x, 1, border_line);
+        }
+        let active_end = active_x + tab_w;
+        let bar_end = offset_x + bar_width;
+        if active_end < bar_end {
+            d.draw_rectangle(active_end, bottom_y, bar_end - active_end, 1, border_line);
         }
 
         let plus_x = offset_x + tab_count as i32 * tab_w;

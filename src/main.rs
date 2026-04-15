@@ -1797,7 +1797,7 @@ fn main() {
         let mut d = rl.begin_drawing(&thread);
 
         // Clear with dark background first
-        d.clear_background(Color::new(20, 20, 25, 255));
+        d.clear_background(Color::new(26, 27, 30, 255));
 
         // Render all panels (active workspace only)
         let ws_focused_panel_id = wm.active().focused_panel_id;
@@ -1815,12 +1815,7 @@ fn main() {
             let tab = &mut panel.tabs[active_idx];
             tab.term.update_render_state();
 
-            let bg_color = unsafe {
-                let mut colors: bindings::GhosttyRenderStateColors = std::mem::zeroed();
-                colors.size = std::mem::size_of::<bindings::GhosttyRenderStateColors>();
-                bindings::ghostty_render_state_colors_get(tab.term.render_state(), &mut colors);
-                Color::new(colors.background.r, colors.background.g, colors.background.b, 255)
-            };
+            let bg_color = Color::new(26, 27, 30, 255);
 
             let tab_bar_h = panel.tab_bar.height;
 
@@ -1893,10 +1888,11 @@ fn main() {
 
             // Focus border (outside scissor)
             if is_focused && panel_count > 1 {
-                d.draw_rectangle(r.x, r.y, r.w, 2, Color::new(80, 140, 220, 200));
-                d.draw_rectangle(r.x, r.y + r.h - 2, r.w, 2, Color::new(80, 140, 220, 200));
-                d.draw_rectangle(r.x, r.y, 2, r.h, Color::new(80, 140, 220, 200));
-                d.draw_rectangle(r.x + r.w - 2, r.y, 2, r.h, Color::new(80, 140, 220, 200));
+                let focus_color = Color::new(58, 62, 78, 255);
+                d.draw_rectangle(r.x, r.y, r.w, 2, focus_color);
+                d.draw_rectangle(r.x, r.y + r.h - 2, r.w, 2, focus_color);
+                d.draw_rectangle(r.x, r.y, 2, r.h, focus_color);
+                d.draw_rectangle(r.x + r.w - 2, r.y, 2, r.h, focus_color);
             }
         });
 
@@ -2480,8 +2476,10 @@ fn main() {
                 }
 
                 let is_renaming = wm.renaming == Some(i);
-                let name_y = row_y + 6;
-                let info_y = row_y + 6 + name_size + 4;
+                let content_h = name_size + 4 + info_size;
+                let top_pad = (ROW_HEIGHT - content_h) / 2;
+                let name_y = row_y + top_pad;
+                let info_y = name_y + name_size + 4;
 
                 if is_renaming {
                     d.draw_rectangle(6, name_y - 1, sidebar_w - 14, name_size + 4, Color::new(30, 35, 55, 255));

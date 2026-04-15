@@ -14,7 +14,7 @@ impl Backend {
     pub fn get_cwd(&self) -> Option<PathBuf> {
         match self {
             Backend::Local(pty) => pty.get_cwd(),
-            Backend::Ssh(_) => None,
+            Backend::Ssh(ssh) => ssh.last_cwd.as_ref().map(PathBuf::from),
         }
     }
 

@@ -201,6 +201,22 @@ extern "C" fn signal_handler(_sig: nix::libc::c_int) {
     SIGNAL_EXIT.store(true, Ordering::SeqCst);
 }
 
+fn ssh_cwd_display(backend: &terminal::backend::Backend, osc_title: &str) -> String {
+    if let Some(cwd) = backend.get_cwd() {
+        return cwd.display().to_string();
+    }
+    // Fallback: try to extract path from terminal title (e.g. "user@host: /path" or "user@host:~/dir")
+    if !osc_title.is_empty() {
+        if let Some(colon_pos) = osc_title.find(':') {
+            let after = osc_title[colon_pos + 1..].trim();
+            if !after.is_empty() && (after.starts_with('/') || after.starts_with('~')) {
+                return after.to_string();
+            }
+        }
+    }
+    "~".to_string()
+}
+
 fn find_resource(name: &str) -> Option<std::path::PathBuf> {
     // 1. Check relative to CWD (development: cargo run)
     let cwd = std::env::current_dir().ok()?;
@@ -1755,10 +1771,11 @@ fn main() {
                 focused_ai_input = tab.router.ai_input_buffer().to_string();
                 focused_auto_exec = tab.router.auto_execute();
                 focused_cwd = if let Some(ref info) = tab.ssh_info {
-                    format!("ssh://{}@{}:{}", info.user, info.host, info.port)
+                    let remote_path = ssh_cwd_display(&tab.backend, &tab.term.last_osc_title);
+                    format!("ssh://{}@{}:{} {}", info.user, info.host, info.port, remote_path)
                 } else if let Some(ref info) = ws.ssh_info {
-                    format!("[SSH {}@{}] {}", info.user, info.host,
-                        tab.backend.get_cwd().map(|p| p.display().to_string()).unwrap_or_else(|| "~".to_string()))
+                    let remote_path = ssh_cwd_display(&tab.backend, &tab.term.last_osc_title);
+                    format!("ssh://{}@{}:{} {}", info.user, info.host, info.port, remote_path)
                 } else {
                     tab.backend.get_cwd()
                         .map(|p| p.display().to_string())

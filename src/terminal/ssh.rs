@@ -8,6 +8,27 @@ use std::net::TcpStream;
 use std::os::unix::io::RawFd;
 use std::time::Duration;
 
+fn percent_decode(input: &str) -> String {
+    let mut out = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(val) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[i+1..i+3]).unwrap_or(""),
+                16,
+            ) {
+                out.push(val);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_string())
+}
+
 fn ssh_log(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -27,11 +48,19 @@ pub struct SshBackend {
     proxy_fd: RawFd,
     bridge_fd: RawFd,
     pub info: SshTabInfo,
+    pub last_cwd: Option<String>,
+    osc_buf: Vec<u8>,
+    in_osc: bool,
 }
 
 impl SshBackend {
     pub fn new(channel: ssh2::Channel, proxy_fd: RawFd, bridge_fd: RawFd, info: SshTabInfo) -> Self {
-        SshBackend { channel, proxy_fd, bridge_fd, info }
+        SshBackend {
+            channel, proxy_fd, bridge_fd, info,
+            last_cwd: None,
+            osc_buf: Vec::with_capacity(256),
+            in_osc: false,
+        }
     }
 
     pub fn proxy_fd(&self) -> RawFd {
@@ -67,6 +96,7 @@ impl SshBackend {
                 Ok(n) => {
                     let bytes = &buf[..n];
                     ssh_log(&format!("channel->vt: {} bytes", n));
+                    self.scan_osc7(bytes);
                     terminal.vt_write(bytes);
                     if let Some(ref mut cap) = capture {
                         cap.extend_from_slice(bytes);
@@ -86,6 +116,58 @@ impl SshBackend {
                 }
             }
         }
+    }
+
+    fn scan_osc7(&mut self, data: &[u8]) {
+        for &b in data {
+            if self.in_osc {
+                if b == 0x07 || b == 0x9C {
+                    // BEL or ST terminates OSC
+                    self.finish_osc();
+                } else if b == 0x1B {
+                    // Could be ESC \ (ST) — peek handled by next byte
+                } else if b == b'\\' && self.osc_buf.last() == Some(&0x1B) {
+                    self.osc_buf.pop(); // remove the ESC we buffered
+                    self.finish_osc();
+                } else {
+                    if self.osc_buf.len() < 512 {
+                        self.osc_buf.push(b);
+                    } else {
+                        self.in_osc = false;
+                        self.osc_buf.clear();
+                    }
+                }
+            } else if b == 0x1B {
+                // Start: check if next byte begins OSC (handled on next iteration)
+                self.osc_buf.clear();
+                self.osc_buf.push(b);
+            } else if b == b']' && self.osc_buf.last() == Some(&0x1B) {
+                self.osc_buf.clear();
+                self.in_osc = true;
+            } else {
+                self.osc_buf.clear();
+            }
+        }
+    }
+
+    fn finish_osc(&mut self) {
+        self.in_osc = false;
+        if let Ok(s) = std::str::from_utf8(&self.osc_buf) {
+            // OSC 7 format: "7;file://hostname/path" or "7;/path"
+            if let Some(rest) = s.strip_prefix("7;") {
+                let path = if let Some(after_scheme) = rest.strip_prefix("file://") {
+                    // Skip hostname part: file://hostname/path -> /path
+                    after_scheme.find('/').map(|i| &after_scheme[i..]).unwrap_or(after_scheme)
+                } else {
+                    rest
+                };
+                let decoded = percent_decode(path);
+                if !decoded.is_empty() {
+                    self.last_cwd = Some(decoded);
+                }
+            }
+        }
+        self.osc_buf.clear();
     }
 
     pub fn write(&mut self, data: &[u8]) {

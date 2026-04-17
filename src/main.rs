@@ -476,7 +476,7 @@ fn main() {
 
     rl.set_target_fps(60);
 
-    let dpi_scale = unsafe {
+    let mut dpi_scale = unsafe {
         let s = raylib::ffi::GetWindowScaleDPI();
         s.y
     };
@@ -599,16 +599,31 @@ fn main() {
             }
             last_autosave = Instant::now();
         }
-        // Handle resize
-        if rl.is_window_resized() {
-            let w = rl.get_screen_width();
-            let h = rl.get_screen_height();
-            if w != prev_width || h != prev_height {
-                let sidebar_w = wm.sidebar_width();
-                relayout_and_resize(&mut wm.active_mut().root, w, h, status_bar_height, sidebar_w, pad, minimap_width, cell_width, cell_height);
-                prev_width = w;
-                prev_height = h;
+        // Handle resize and DPI changes (e.g. moving to an external monitor).
+        let current_dpi = unsafe { raylib::ffi::GetWindowScaleDPI().y };
+        let dpi_changed = (current_dpi - dpi_scale).abs() > 0.01;
+        let w = rl.get_screen_width();
+        let h = rl.get_screen_height();
+        if rl.is_window_resized() || dpi_changed || w != prev_width || h != prev_height {
+            if dpi_changed {
+                let old_font = mono_font;
+                dpi_scale = current_dpi;
+                metrics = load_font(font_size, dpi_scale, &mut codepoints);
+                mono_font = metrics.font;
+                cell_width = metrics.cell_width;
+                cell_height = metrics.cell_height;
+                status_bar_height = font_size + 8;
+                unsafe { raylib::ffi::UnloadFont(old_font); }
             }
+            let sidebar_w = wm.sidebar_width();
+            for ws in &mut wm.workspaces {
+                relayout_and_resize(
+                    &mut ws.root, w, h, status_bar_height, sidebar_w,
+                    pad, minimap_width, cell_width, cell_height,
+                );
+            }
+            prev_width = w;
+            prev_height = h;
         }
 
         // Read PTY and poll AI for ALL workspaces/panels/tabs

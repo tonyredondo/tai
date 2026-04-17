@@ -476,10 +476,20 @@ fn main() {
 
     rl.set_target_fps(60);
 
-    let mut dpi_scale = unsafe {
-        let s = raylib::ffi::GetWindowScaleDPI();
-        s.y
+    // Derive DPI scale from render_w / screen_w. This updates reliably on macOS
+    // whenever the window moves to a display with a different pixel density,
+    // unlike GetWindowScaleDPI() which can report stale values.
+    let compute_dpi = |rl: &RaylibHandle| -> f32 {
+        let screen_w = rl.get_screen_width() as f32;
+        let render_w = unsafe { raylib::ffi::GetRenderWidth() as f32 };
+        let raw = unsafe { raylib::ffi::GetWindowScaleDPI().y };
+        let ratio = if screen_w > 0.0 { render_w / screen_w } else { raw };
+        // Prefer the render/screen ratio but fall back to GetWindowScaleDPI
+        // when the ratio is suspicious (e.g. during window init).
+        if ratio >= 0.5 && ratio <= 4.0 { ratio } else { raw.max(1.0) }
     };
+    let mut dpi_scale = compute_dpi(&rl);
+    eprintln!("[TAI] Startup DPI scale: {}", dpi_scale);
 
     let mut codepoints = build_terminal_codepoints();
     let mut metrics = load_font(font_size, dpi_scale, &mut codepoints);
@@ -600,12 +610,18 @@ fn main() {
             last_autosave = Instant::now();
         }
         // Handle resize and DPI changes (e.g. moving to an external monitor).
-        let current_dpi = unsafe { raylib::ffi::GetWindowScaleDPI().y };
-        let dpi_changed = (current_dpi - dpi_scale).abs() > 0.01;
+        let current_dpi = compute_dpi(&rl);
+        let dpi_changed = (current_dpi - dpi_scale).abs() > 0.05;
         let w = rl.get_screen_width();
         let h = rl.get_screen_height();
-        if rl.is_window_resized() || dpi_changed || w != prev_width || h != prev_height {
+        let size_changed = w != prev_width || h != prev_height;
+        if rl.is_window_resized() || dpi_changed || size_changed {
             if dpi_changed {
+                eprintln!(
+                    "[TAI] DPI scale changed: {:.3} -> {:.3}, reloading font at size {} ({} panels)",
+                    dpi_scale, current_dpi, font_size,
+                    wm.workspaces.iter().map(|w| w.panel_count()).sum::<usize>(),
+                );
                 let old_font = mono_font;
                 dpi_scale = current_dpi;
                 metrics = load_font(font_size, dpi_scale, &mut codepoints);
@@ -613,6 +629,12 @@ fn main() {
                 cell_width = metrics.cell_width;
                 cell_height = metrics.cell_height;
                 status_bar_height = font_size + 8;
+                // Propagate new cell height to every panel's tab bar.
+                for ws in &mut wm.workspaces {
+                    ws.root.for_each_panel_mut(&mut |panel| {
+                        panel.tab_bar.update_height(cell_height);
+                    });
+                }
                 unsafe { raylib::ffi::UnloadFont(old_font); }
             }
             let sidebar_w = wm.sidebar_width();
